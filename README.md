@@ -232,6 +232,17 @@ python capture_dcard_playwright.py --forum relationship --posts 20 --headed
 **注意：「測試 Dcard 連線」只測直接 `_api`。** 它顯示 403 不代表工具
 不能用——自動模式按「開始蒐集」仍會自動改用 Playwright。
 
+### 裝好 Playwright 卻說沒安裝（2.0 的 bug，2.1 已修）
+
+2.0 版有一個 bug：程式啟動時若尚未安裝 Playwright，會把「未安裝」這個
+狀態快取住，之後就算在同一個執行中的程式裡按「安裝 Playwright」裝好了，
+按「開始蒐集」還是會說尚未安裝，一定要關掉程式重開才認得出來。
+
+- **舊版暫時解法**：裝完後把程式完全關掉再重開一次，再按「開始蒐集」。
+- **2.1 版已修**：安裝完會立刻重新偵測，不需重開；若仍偵測不到，執行紀錄
+  會寫使用的 Python 路徑，並提示關掉重開或確認啟動程式用的 Python 和
+  安裝用的 Python 是同一個。
+
 ## Gemini 設定
 
 - 到 Google AI Studio 取得 Gemini API Key，貼到「AI 趨勢分析」分頁。

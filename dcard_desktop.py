@@ -18,6 +18,7 @@ curl_cffi），被 Cloudflare 擋 403/429 時自動切換到 Playwright 自動�
 API Key、Cookie 與 Oxylabs 帳號密碼只存在記憶體，絕不寫入檔案或 Excel。
 """
 import base64
+import importlib
 import json
 import os
 import queue
@@ -53,6 +54,28 @@ PLAYWRIGHT_INSTALL_MSG = (
     '  pip install playwright\n'
     '  playwright install chromium\n'
     '或在本工具按「安裝 Playwright（自動）」。')
+
+
+def reload_playwright():
+    """安裝後重新偵測 Playwright（v2.1 修復）。
+
+    原因：程式啟動時若尚未安裝，模組層的 guarded import 會把
+    sync_playwright 設為 None 並一直快取下去；之後就算在同一個
+    執行中的程式裡按「安裝 Playwright」裝好了，playwright_available()
+    也永遠回 False，必須關掉重開才認得出來。
+    本函式在每次檢查時都重新 import 一次，裝好後不需重開程式。
+    未安裝時回 False，絕不拋錯。
+    """
+    global sync_playwright
+    if sync_playwright is not None:
+        return True
+    try:
+        importlib.invalidate_caches()
+        mod = importlib.import_module('playwright.sync_api')
+        sync_playwright = getattr(mod, 'sync_playwright', None)
+        return sync_playwright is not None
+    except Exception:
+        return False
 
 BASE = 'https://www.dcard.tw'
 API_BASE = 'https://www.dcard.tw/_api'
@@ -459,8 +482,14 @@ def is_dcard_api_url(url):
 
 
 def playwright_available():
-    """Playwright 是否可用。未安裝時回 False，絕不拋錯。"""
-    return sync_playwright is not None
+    """Playwright 是否可用。未安裝時回 False，絕不拋錯。
+
+    v2.1：若啟動時快取為 None，每次檢查都重新 import 一次，
+    避免安裝後還要重開程式才認得出來。
+    """
+    if sync_playwright is not None:
+        return True
+    return reload_playwright()
 
 
 def parse_captured_responses(captured, selected=None, limit_per_board=None,
@@ -527,6 +556,9 @@ def playwright_collect_boards(selected, limit, include_comments, popular,
     讓 import 失敗或瀏覽器啟動錯誤變成難懂的 traceback。
     本函式不碰 Tkinter，可在 worker 執行緒呼叫；cancel 為 threading.Event。
     """
+    if sync_playwright is None:
+        # v2.1：先重新偵測一次（安裝後不需重開程式），仍沒有才報安裝指令。
+        reload_playwright()
     if sync_playwright is None:
         raise RuntimeError(PLAYWRIGHT_INSTALL_MSG)
     if log is None:
@@ -958,7 +990,7 @@ def build_appendix(numbered, report):
 class DcardApp:
     def __init__(self, root):
         self.root = root
-        root.title('Dcard 文章與留言蒐集器 2.0（含 Gemini 趨勢分析）')
+        root.title('Dcard 文章與留言蒐集器 2.1（含 Gemini 趨勢分析）')
         root.geometry('1080x780')
         root.minsize(850, 620)
         self.q = queue.Queue()
@@ -1339,7 +1371,7 @@ class DcardApp:
 
         def task():
             try:
-                self.log('開始安裝 Playwright：pip install playwright…')
+                self.log(f'開始安裝 Playwright：pip install playwright…（使用 {sys.executable}）')
                 r1 = subprocess.run(
                     [sys.executable, '-m', 'pip', 'install', 'playwright'],
                     capture_output=True, text=True, timeout=600)
@@ -1357,6 +1389,26 @@ class DcardApp:
                     self.log(f'playwright install chromium 失敗（結束碼 {r2.returncode}）：{tail2}')
                     self.q.put(('install_done', False))
                     return
+                # v2.1：安裝完立刻重新偵測，不需重開程式。若仍偵測不到，
+                # 很可能是裝到另一個 Python（啟動程式用的 Python 不同），
+                # 記錄檢查結果，讓使用者知道要關掉重開或換 Python。
+                if reload_playwright():
+                    self.log('Playwright 安裝完成：已重新偵測到 Playwright，不需重開程式，'
+                             '可直接按「開始蒐集」。')
+                else:
+                    try:
+                        r3 = subprocess.run(
+                            [sys.executable, '-c',
+                             'import playwright; print(playwright.__version__)'],
+                            capture_output=True, text=True, timeout=30)
+                        check = (r3.stdout + r3.stderr).strip()[-200:]
+                        self.log(f'安裝指令已完成，但本程式仍偵測不到 Playwright。'
+                                 f'用 {sys.executable} 檢查的結果：{check}。'
+                                 '請關閉本程式再重開一次；若仍不行，請確認啟動程式'
+                                 '用的 Python 和安裝用的 Python 是同一個。')
+                    except Exception as exc:
+                        self.log(f'安裝指令已完成，但本程式仍偵測不到 Playwright（{exc}）。'
+                                 '請關閉本程式再重開一次。')
                 self.log('Playwright 安裝完成：已安裝 playwright 與 Chromium，請再按「開始蒐集」。')
                 self.q.put(('install_done', True))
             except Exception as exc:
@@ -1939,7 +1991,17 @@ class DcardApp:
                         self.install_btn.config(state='normal')
                     except Exception:
                         pass
-                    if ok:
+                    # v2.1：安裝指令完成不代表本程式已偵測到，重新檢查一次。
+                    # 若仍偵測不到，提示關掉重開，而不是誤報成功。
+                    if ok and not playwright_available():
+                        self.status.set('安裝指令已完成，但本程式仍偵測不到 Playwright，請關閉程式再重開一次。')
+                        messagebox.showwarning(
+                            '請重開程式',
+                            '安裝指令已完成，但本程式仍偵測不到 Playwright。\n\n'
+                            '請先關閉本程式再重開一次，然後按「開始蒐集」。\n'
+                            '若重開後仍不行，請確認啟動程式用的 Python 和安裝用的\n'
+                            'Python 是同一個（執行紀錄有寫使用的 Python 路徑）。')
+                    elif ok:
                         self.status.set('Playwright 安裝完成，請按「開始蒐集」。')
                         messagebox.showinfo('安裝完成', 'Playwright 與 Chromium 已安裝完成，請再按「開始蒐集」。')
                     else:

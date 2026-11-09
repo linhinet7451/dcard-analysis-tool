@@ -17,7 +17,7 @@ from dcard_desktop import (
     parse_har_entries, parse_har_data, classify_dcard_har_url,
     curl_cffi_available, curl_cffi_get_json,
     is_dcard_api_url as is_dcard_api_url_desktop,
-    playwright_available, playwright_collect_boards,
+    playwright_available, playwright_collect_boards, reload_playwright,
     parse_captured_responses, parse_oxylabs_result, oxylabs_fetch_json,
     PLAYWRIGHT_INSTALL_MSG, OXYLABS_URL,
     SAMPLE_POSTS, SAMPLE_COMMENTS, POST_COLS, COMMENT_COLS,
@@ -315,10 +315,16 @@ def test_parse_captured_responses():
 
 
 def test_playwright_collect_boards_missing():
-    # 不啟動瀏覽器：把 guarded import 旗標暫時設為 None，必須明確報安裝指令
+    # 不啟動瀏覽器：把 guarded import 旗標暫時設為 None，並模擬 import 失敗，
+    # 必須明確報安裝指令（v2.1：playwright_available() 會重新 import，
+    # 所以要連 import 也 mock 掉，否則在已安裝的機器上會誤判為可用）
+    import importlib
     original = dcard_desktop.sync_playwright
+    original_import = importlib.import_module
     try:
         dcard_desktop.sync_playwright = None
+        importlib.import_module = lambda name, *a, **k: (_ for _ in ()).throw(
+            ImportError("No module named 'playwright'"))
         assert playwright_available() is False
         try:
             playwright_collect_boards([("美食", "food")], 10, True, False)
@@ -327,8 +333,45 @@ def test_playwright_collect_boards_missing():
             assert "pip install playwright" in str(exc), str(exc)
             assert "playwright install chromium" in str(exc), str(exc)
     finally:
+        importlib.import_module = original_import
         dcard_desktop.sync_playwright = original
     assert "pip install playwright" in PLAYWRIGHT_INSTALL_MSG
+
+
+def test_playwright_available_reloads_after_install():
+    # v2.1 回歸測試：模擬「啟動時未安裝 → 安裝後才出現」的情況。
+    # 把一個假的 playwright.sync_api 模組放進 sys.modules，
+    # sync_playwright 先設為 None，playwright_available() 必須重新
+    # import 並回 True，而不是一直回 False（舊 bug：要重開程式才認得）。
+    import types
+    original = dcard_desktop.sync_playwright
+    fake_mod = types.ModuleType("playwright.sync_api")
+    fake_mod.sync_playwright = object()
+    try:
+        dcard_desktop.sync_playwright = None
+        sys.modules["playwright.sync_api"] = fake_mod
+        assert playwright_available() is True
+        assert dcard_desktop.sync_playwright is fake_mod.sync_playwright
+        assert reload_playwright() is True
+    finally:
+        sys.modules.pop("playwright.sync_api", None)
+        dcard_desktop.sync_playwright = original
+
+
+def test_playwright_available_false_when_import_fails():
+    # import 失敗時仍回 False，不拋錯。
+    import importlib
+    original = dcard_desktop.sync_playwright
+    original_import = importlib.import_module
+    try:
+        dcard_desktop.sync_playwright = None
+        importlib.import_module = lambda name, *a, **k: (_ for _ in ()).throw(
+            ImportError("No module named 'playwright'"))
+        assert playwright_available() is False
+        assert reload_playwright() is False
+    finally:
+        importlib.import_module = original_import
+        dcard_desktop.sync_playwright = original
 
 
 def test_parse_oxylabs_result():

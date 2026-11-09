@@ -18,8 +18,10 @@ from dcard_desktop import (
     curl_cffi_available, curl_cffi_get_json,
     is_dcard_api_url as is_dcard_api_url_desktop,
     playwright_available, playwright_collect_boards, reload_playwright,
+    stealth_available, stealth_collect_boards, reload_stealth,
+    human_delay, human_scroll_steps, parse_next_data,
     parse_captured_responses, parse_oxylabs_result, oxylabs_fetch_json,
-    PLAYWRIGHT_INSTALL_MSG, OXYLABS_URL,
+    PLAYWRIGHT_INSTALL_MSG, STEALTH_INSTALL_MSG, OXYLABS_URL,
     SAMPLE_POSTS, SAMPLE_COMMENTS, POST_COLS, COMMENT_COLS,
 )
 
@@ -372,6 +374,166 @@ def test_playwright_available_false_when_import_fails():
     finally:
         importlib.import_module = original_import
         dcard_desktop.sync_playwright = original
+
+
+def test_stealth_available_returns_tuple():
+    # 回傳 (bool, 引擎名稱)，引擎只能是這四種，且絕不拋錯
+    ok, engine = stealth_available()
+    assert isinstance(ok, bool)
+    assert engine in ("patchright", "camoufox", "playwright", "none"), engine
+    assert ok == (engine != "none")
+    # 本 VM 沒裝 patchright / camoufox，playwright 也沒裝，應為 none
+    assert (ok, engine) == (False, "none")
+
+
+def test_stealth_collect_boards_missing():
+    # 不啟動瀏覽器：三個引擎的旗標都設為 None，並模擬 import 全部失敗，
+    # 必須明確報安裝指令（含 patchright 與 camoufox）
+    import importlib
+    originals = (dcard_desktop.sync_playwright,
+                 dcard_desktop._patchright_sync_playwright,
+                 dcard_desktop._camoufox_Camoufox)
+    original_import = importlib.import_module
+    try:
+        dcard_desktop.sync_playwright = None
+        dcard_desktop._patchright_sync_playwright = None
+        dcard_desktop._camoufox_Camoufox = None
+        importlib.import_module = lambda name, *a, **k: (_ for _ in ()).throw(
+            ImportError(f"No module named '{name}'"))
+        assert stealth_available() == (False, "none")
+        try:
+            stealth_collect_boards([("美食", "food")], 10, True, False)
+            raise AssertionError("未安裝任何隱身引擎時應 raise RuntimeError")
+        except RuntimeError as exc:
+            assert "pip install patchright" in str(exc), str(exc)
+            assert "patchright install chromium" in str(exc), str(exc)
+            assert "camoufox" in str(exc), str(exc)
+    finally:
+        importlib.import_module = original_import
+        (dcard_desktop.sync_playwright,
+         dcard_desktop._patchright_sync_playwright,
+         dcard_desktop._camoufox_Camoufox) = originals
+    assert "pip install patchright" in STEALTH_INSTALL_MSG
+    assert "camoufox" in STEALTH_INSTALL_MSG
+
+
+def test_reload_stealth_after_install():
+    # v2.1 教訓的隱身版回歸測試：模擬「啟動時未安裝 → 安裝後才出現」。
+    # 把假的 patchright.sync_api 模組放進 sys.modules，旗標先設為 None，
+    # reload_stealth() 必須重新 import 並回 'patchright'，不需重開程式。
+    import types
+    originals = (dcard_desktop.sync_playwright,
+                 dcard_desktop._patchright_sync_playwright,
+                 dcard_desktop._camoufox_Camoufox)
+    fake_mod = types.ModuleType("patchright.sync_api")
+    fake_mod.sync_playwright = object()
+    try:
+        dcard_desktop.sync_playwright = None
+        dcard_desktop._patchright_sync_playwright = None
+        dcard_desktop._camoufox_Camoufox = None
+        sys.modules["patchright.sync_api"] = fake_mod
+        assert reload_stealth() == "patchright"
+        assert stealth_available() == (True, "patchright")
+        assert dcard_desktop._patchright_sync_playwright is fake_mod.sync_playwright
+    finally:
+        sys.modules.pop("patchright.sync_api", None)
+        (dcard_desktop.sync_playwright,
+         dcard_desktop._patchright_sync_playwright,
+         dcard_desktop._camoufox_Camoufox) = originals
+
+
+def test_reload_stealth_camoufox_second_choice():
+    # Patchright 沒有時，Camoufox 是第二順位：patchright 的 import 模擬失敗，
+    # 假的 camoufox.sync_api 在 sys.modules 裡，必須回 'camoufox'。
+    import types
+    import importlib
+    originals = (dcard_desktop.sync_playwright,
+                 dcard_desktop._patchright_sync_playwright,
+                 dcard_desktop._camoufox_Camoufox)
+    original_import = importlib.import_module
+
+    def _fake_import(name, *a, **k):
+        if name == "patchright.sync_api":
+            raise ImportError("No module named 'patchright'")
+        return original_import(name, *a, **k)
+
+    fake_mod = types.ModuleType("camoufox.sync_api")
+    fake_mod.Camoufox = object()
+    try:
+        dcard_desktop.sync_playwright = None
+        dcard_desktop._patchright_sync_playwright = None
+        dcard_desktop._camoufox_Camoufox = None
+        sys.modules["camoufox.sync_api"] = fake_mod
+        importlib.import_module = _fake_import
+        assert reload_stealth() == "camoufox"
+        assert stealth_available() == (True, "camoufox")
+    finally:
+        importlib.import_module = original_import
+        sys.modules.pop("camoufox.sync_api", None)
+        (dcard_desktop.sync_playwright,
+         dcard_desktop._patchright_sync_playwright,
+         dcard_desktop._camoufox_Camoufox) = originals
+
+
+def test_human_scroll_steps():
+    # 步長總和必須恰好等於 total_px，每步在 300–700 之間
+    for total in (300, 700, 800, 1000, 2500, 5000):
+        steps = human_scroll_steps(total)
+        assert sum(steps) == total, (total, steps)
+        assert all(300 <= s <= 700 for s in steps), (total, steps)
+        assert len(steps) >= 1
+    # 邊界：0 以下回 []；小於最小步長時一步到位
+    assert human_scroll_steps(0) == []
+    assert human_scroll_steps(-50) == []
+    assert human_scroll_steps(100) == [100]
+    assert human_scroll_steps(299) == [299]
+    # 多次呼叫的步長應有隨機性（不要求每次都不同，但至少不是固定值）
+    assert human_scroll_steps("not-a-number") == []
+
+
+def test_human_delay():
+    assert human_delay(0, 0) == 0.0
+    assert human_delay(0.5, 0.5) == 0.5
+    # min > max 時自動對調，回傳值落在對調後的區間內
+    d = human_delay(2, 1)
+    assert 1.0 <= d <= 2.0, d
+
+
+def test_parse_next_data():
+    html = ('<html><head><script id="__NEXT_DATA__" type="application/json">'
+            '{"props":{"pageProps":{"a":1}}}</script></head></html>')
+    assert parse_next_data(html) == {"props": {"pageProps": {"a": 1}}}
+    # 屬性順序顛倒也要能抽
+    html2 = '<script type="application/json" id="__NEXT_DATA__">{"x": 2}</script>'
+    assert parse_next_data(html2) == {"x": 2}
+    # 找不到、空字串、非字串、壞 JSON、解析結果不是 dict 都回 None，不拋錯
+    assert parse_next_data("<html><body>沒有 NEXT_DATA</body></html>") is None
+    assert parse_next_data("") is None
+    assert parse_next_data(None) is None
+    assert parse_next_data(123) is None
+    assert parse_next_data(
+        '<script id="__NEXT_DATA__" type="application/json">{bad json</script>') is None
+    assert parse_next_data(
+        '<script id="__NEXT_DATA__" type="application/json">[1, 2]</script>') is None
+
+
+def test_posts_from_next_data():
+    # __NEXT_DATA__ 裡巢狀的貼文列表要能被遞迴找出並轉成 POST_COLS rows
+    data = {"props": {"pageProps": {"posts": SAMPLE_POSTS_JSON[:1]}}}
+    rows = dcard_desktop._posts_from_next_data(data, "food")
+    assert len(rows) == 1, rows
+    assert rows[0]["文章ID"] == "123"
+    assert rows[0]["標題"] == "測試標題"
+    assert rows[0]["看板"] == "美食" and rows[0]["看板代碼"] == "food"
+    for col in POST_COLS:
+        assert col in rows[0]
+    # 沒有貼文列表、不是 dict 時回 []
+    assert dcard_desktop._posts_from_next_data({"props": {}}, "food") == []
+    assert dcard_desktop._posts_from_next_data(None, "food") == []
+    assert dcard_desktop._posts_from_next_data([], "food") == []
+    # 混合非貼文元素的 list 不應被誤認
+    assert dcard_desktop._posts_from_next_data(
+        {"x": [{"id": "1", "title": "t"}, {"nope": True}]}, "food") == []
 
 
 def test_parse_oxylabs_result():

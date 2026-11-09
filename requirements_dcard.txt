@@ -4,10 +4,10 @@ openpyxl>=3.1,<4
 # 本工具不使用 beautifulsoup4（Dcard 走 JSON _api，不解析 HTML）。
 #
 # ── 自動模式建議安裝（2.0 版，選用；以下兩行預設是註解，不會被安裝）──
-# 自動模式的流程是：直接 _api → curl-cffi → Playwright 自動瀏覽。
-# 想讓「自動」模式在被擋 403 時能自動改用 Playwright，第一次使用前請
-# 取消下面 playwright 兩行的註解安裝，或直接按工具裡的
-# 「安裝 Playwright（自動）」按鈕（會自動跑 pip install + 安裝 Chromium）。
+# 自動模式的流程是：直接 _api → curl-cffi → 隱身瀏覽器 → 舊 Playwright。
+# 想讓「自動」模式在被擋 403 時能自動改用隱身瀏覽器，第一次使用前請
+# 取消下面 patchright 兩行的註解安裝，或直接按工具裡的
+# 「安裝隱身瀏覽器（自動）」按鈕（會自動跑 pip install + 安裝 Chromium）。
 # curl-cffi：403 時的 TLS 偽裝重試。已實測在被擋的 IP 上單獨用也還是 403，
 #   主因是 IP 信譽，不是 TLS 指紋；未安裝時主程式仍可正常使用。
 # curl-cffi>=0.5,<1
@@ -15,3 +15,15 @@ openpyxl>=3.1,<4
 #   回應時使用，安裝後還需執行 `playwright install chromium`
 #   （或按工具裡的「安裝 Playwright（自動）」一次完成）。
 # playwright>=1.40,<2
+#
+# ── 隱身瀏覽器（2.2 版，選用；預設是註解，不會被安裝）──
+# Patchright（首選）：改過的 Playwright，API 完全相同，普通 Playwright
+#   會漏 automation 訊號，Patchright 不會。裝完再跑 `patchright install chromium`。
+# patchright>=1.40,<2
+# Camoufox（次選）：改過的 Firefox，指紋在 C++ 層注入，humanize=True 會做
+#   人類曲線滑鼠移動。裝完再跑 `python -m camoufox fetch` 下載改過的 Firefox。
+#   需手動安裝，工具裡的「安裝隱身瀏覽器（自動）」只裝 Patchright。
+# camoufox[geoip]>=0.5,<1
+# playwright-stealth：不要只依賴它，已有未解決的偵測問題，僅當舊版
+#   Playwright 的最後備援（主程式會自動套用，不需手動裝）。
+# playwright-stealth>=0.1,<1

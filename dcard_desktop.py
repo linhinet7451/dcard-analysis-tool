@@ -1,10 +1,16 @@
 """Dcard 文章與留言蒐集桌面工具（讀取 Dcard 內部 _api）。
 
-2.0 全自動模式：預設「自動（建議）」會先試直接 _api（requests，再試一次
-curl_cffi），被 Cloudflare 擋 403/429 時自動切換到 Playwright 自動瀏覽
-（在使用者自己的電腦、用自己的 Chrome profile 真的去逛 Dcard），
-使用者只要按「開始蒐集」，不需手動逛 Dcard、不用匯出 HAR。
-若 Playwright 也被擋，最後的全自動備援是 Oxylabs 付費 API 模式。
+2.2 隱身瀏覽器模式：預設「自動（建議）」會先試直接 _api（requests，再試一次
+curl_cffi），被 Cloudflare 擋 403/429 時自動切換到隱身瀏覽器（Patchright
+優先，其次 Camoufox，最後才是舊版 Playwright＋stealth 插件），在使用者
+自己的電腦、用自己的 Chrome profile 與人類化行為（隨機延遲、隨機捲動、
+偶爾移動滑鼠）真的去逛 Dcard，使用者只要按「開始蒐集」，不需手動逛
+Dcard、不用匯出 HAR。若隱身瀏覽器也失敗，自動模式再退回舊 Playwright；
+最後的全自動備援是 Oxylabs 付費 API 模式。
+
+非 API 備援：看板／文章頁是 Next.js，整頁資料嵌在
+<script id="__NEXT_DATA__"> 裡（parse_next_data），瀏覽器攔截不到
+_api 回應時可改用它解析，不需打 _api、不用執行 JS。
 
 與 PTT 工具相同的結構與使用方式，資料來源改為 Dcard：
   https://www.dcard.tw/_api/forums
@@ -20,8 +26,10 @@ API Key、Cookie 與 Oxylabs 帳號密碼只存在記憶體，絕不寫入檔案
 import base64
 import importlib
 import json
+import math
 import os
 import queue
+import random
 import re
 import subprocess
 import sys
@@ -48,6 +56,21 @@ try:
     from playwright.sync_api import sync_playwright
 except Exception:
     sync_playwright = None
+
+try:
+    # 2.2 隱身瀏覽器首選：Patchright 是改過的 Playwright（drop-in 替換，
+    # API 與 playwright.sync_api 完全相同），未安裝時為 None。
+    from patchright.sync_api import sync_playwright as _patchright_sync_playwright
+except Exception:
+    _patchright_sync_playwright = None
+
+try:
+    # 2.2 隱身瀏覽器次選：Camoufox 是改過的 Firefox，指紋在 C++ 層注入，
+    # API 是 Playwright 風格（Camoufox(...) 當 context manager，
+    # humanize=True 做人類曲線滑鼠移動）。未安裝時為 None。
+    from camoufox.sync_api import Camoufox as _camoufox_Camoufox
+except Exception:
+    _camoufox_Camoufox = None
 
 PLAYWRIGHT_INSTALL_MSG = (
     '尚未安裝 Playwright，請先安裝一次（只需裝一次）：\n'
@@ -655,6 +678,428 @@ def playwright_collect_boards(selected, limit, include_comments, popular,
     return posts, comments
 
 
+# ───────────────────── 隱身瀏覽器（2.2：Patchright / Camoufox）─────────────────────
+# 普通 Playwright 會漏 automation 訊號（navigator.webdriver、CDP、TLS 指紋），
+# 2026 年主流做法是換不會漏訊號的瀏覽器：
+#   Patchright：改過的 Playwright，API 完全相同，drop-in 替換（首選）。
+#   Camoufox：改過的 Firefox，指紋在 C++ 層注入（不是執行時打補丁），
+#     humanize=True 會做人類曲線滑鼠移動（次選）。
+#   舊版 Playwright：只當最後備援，可加 playwright-stealth 插件，但該插件
+#     已有未解決的偵測問題，不要只依賴它。
+# nodriver（直接走 CDP、不走 WebDriver）也是同級做法，但本工具以
+# Playwright 相容的 Patchright／Camoufox 為主，程式結構不用重寫。
+STEALTH_INSTALL_MSG = (
+    '尚未安裝隱身瀏覽器，請先安裝一次（只需裝一次）：\n'
+    '  pip install patchright\n'
+    '  patchright install chromium\n'
+    '或安裝 Camoufox（改過的 Firefox，指紋在 C++ 層注入）：\n'
+    '  pip install camoufox[geoip]\n'
+    '  python -m camoufox fetch\n'
+    '或在本工具按「安裝隱身瀏覽器（自動）」（會自動裝 Patchright）。\n'
+    '注意：playwright-stealth 插件已有未解決的偵測問題，只當最後備援，'
+    '不要只依賴它。')
+
+
+def reload_stealth():
+    """動態重新偵測隱身瀏覽器引擎，回傳引擎名稱。
+
+    優先順序：patchright > camoufox > playwright（舊版，僅備援）。
+    v2.1 的教訓：不要用啟動時快取的 None，安裝後要能重新偵測，
+    不需重開程式。未安裝任何引擎時回 'none'，絕不拋錯。
+    """
+    global _patchright_sync_playwright, _camoufox_Camoufox
+    if _patchright_sync_playwright is not None:
+        return 'patchright'
+    try:
+        importlib.invalidate_caches()
+        mod = importlib.import_module('patchright.sync_api')
+        _patchright_sync_playwright = getattr(mod, 'sync_playwright', None)
+        if _patchright_sync_playwright is not None:
+            return 'patchright'
+    except Exception:
+        pass
+    if _camoufox_Camoufox is not None:
+        return 'camoufox'
+    try:
+        mod = importlib.import_module('camoufox.sync_api')
+        _camoufox_Camoufox = getattr(mod, 'Camoufox', None)
+        if _camoufox_Camoufox is not None:
+            return 'camoufox'
+    except Exception:
+        pass
+    if sync_playwright is not None:
+        return 'playwright'
+    if reload_playwright():
+        return 'playwright'
+    return 'none'
+
+
+def stealth_available():
+    """回傳 (可用與否, 引擎名稱)。
+
+    引擎為 'patchright' / 'camoufox' / 'playwright' / 'none'。
+    每次檢查都動態 import（安裝後不需重開程式），絕不拋錯。
+    """
+    try:
+        engine = reload_stealth()
+    except Exception:
+        return False, 'none'
+    return engine != 'none', engine
+
+
+def human_delay(min_s=1.0, max_s=3.0):
+    """隨機人類化延遲：回傳實際延遲秒數並睡這麼久。
+
+    min_s > max_s 時自動對調；負數視為 0。瀏覽器流程裡用它取代
+    固定 sleep，讓請求間隔不呈現固定節奏。
+    """
+    try:
+        lo, hi = float(min_s), float(max_s)
+    except (TypeError, ValueError):
+        lo, hi = 1.0, 3.0
+    lo, hi = max(0.0, lo), max(0.0, hi)
+    if lo > hi:
+        lo, hi = hi, lo
+    delay = random.uniform(lo, hi)
+    time.sleep(delay)
+    return delay
+
+
+def human_scroll_steps(total_px, min_step=300, max_step=700):
+    """把一次捲動拆成多步隨機步長（預設每步 300–700px）。
+
+    回傳步長 list，總和恰好等於 total_px；total_px <= 0 回 []；
+    total_px 小於 min_step 時回 [total_px]（一步到位，無法再拆）。
+    total_px >= min_step 時，每步都在 [min_step, max_step] 內。
+    """
+    try:
+        total = int(total_px)
+    except (TypeError, ValueError):
+        return []
+    if total <= 0:
+        return []
+    try:
+        lo, hi = int(min_step), int(max_step)
+    except (TypeError, ValueError):
+        lo, hi = 300, 700
+    if lo <= 0:
+        lo = 1
+    if hi < lo:
+        lo, hi = hi, lo
+    if total < lo:
+        return [total]
+    n = max(1, math.ceil(total / hi))
+    while n > 1 and n * lo > total:
+        n -= 1
+    steps = [lo] * n
+    remaining = total - lo * n
+    extra_cap = hi - lo
+    indices = list(range(n))
+    random.shuffle(indices)
+    for i in indices:
+        if remaining <= 0:
+            break
+        add = random.randint(0, min(extra_cap, remaining))
+        steps[i] += add
+        remaining -= add
+    # 隨機分配時可能取到 0 而留下剩餘，補到還有空間的步
+    i = 0
+    while remaining > 0:
+        idx = indices[i % n]
+        room = hi - steps[idx]
+        if room > 0:
+            add = min(room, remaining)
+            steps[idx] += add
+            remaining -= add
+        i += 1
+        if i > n * 4 and remaining > 0:
+            # 理論上不應發生（total <= n*hi 保證裝得下）；保底放最後一步
+            steps[-1] += remaining
+            remaining = 0
+    return steps
+
+
+_NEXT_DATA_RE = re.compile(
+    r'<script[^>]*\bid=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+    re.S | re.I)
+
+
+def parse_next_data(html):
+    """從 Dcard 看板／文章頁 HTML 抽出 __NEXT_DATA__ 的 JSON。
+
+    Next.js 會把整頁資料嵌在 <script id="__NEXT_DATA__"> 裡，
+    不用打 _api、不用執行 JS 就能拿到。找不到、不是 str、JSON
+    損壞或解析結果不是 dict 時回 None，絕不拋錯。
+    """
+    try:
+        if not isinstance(html, str) or not html:
+            return None
+        m = _NEXT_DATA_RE.search(html)
+        if not m:
+            return None
+        data = json.loads(m.group(1).strip())
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _posts_from_next_data(data, alias=''):
+    """從 __NEXT_DATA__ dict 裡遞迴找出貼文列表，轉成 POST_COLS 欄位的 rows。
+
+    Dcard 的 __NEXT_DATA__ 結構可能隨改版變動，不寫死路徑：
+    遞迴走訪 dict / list，任何元素同時有 id 與 title 的 list 都視為
+    候選貼文列表，用 parse_posts 解析後轉 row。找不到回 []。
+    """
+    if not isinstance(data, dict):
+        return []
+    forum_names = dict((a, n) for n, a in DEFAULT_FORUMS)
+    found = []
+    seen = set()
+
+    def _walk(node):
+        if isinstance(node, list):
+            cands = [x for x in node
+                     if isinstance(x, dict) and x.get('id') and x.get('title')]
+            if cands and len(cands) == len(node):
+                for norm in parse_posts(node):
+                    if norm['id'] not in seen:
+                        seen.add(norm['id'])
+                        a = alias or norm.get('forumAlias') or ''
+                        found.append(_har_post_row(
+                            norm, a, forum_names.get(a, '')))
+                return
+            for x in node:
+                _walk(x)
+        elif isinstance(node, dict):
+            for v in node.values():
+                _walk(v)
+
+    _walk(data)
+    return found
+
+
+def _apply_stealth_sync(page):
+    """對原版 Playwright 頁面套用 playwright-stealth（最後備援）。
+
+    playwright-stealth 已有未解決的偵測問題，不要只依賴它：
+    未安裝或套用失敗時靜默跳過，絕不拋錯。
+    """
+    try:
+        from playwright_stealth import stealth_sync
+        stealth_sync(page)
+    except Exception:
+        pass
+
+
+def stealth_collect_boards(selected, limit, include_comments, popular,
+                           user_data_dir='./dcard_profile', headed=False,
+                           timeout=30, cancel=None, log=None):
+    """用隱身瀏覽器自動蒐集 Dcard，完全不需使用者手動操作。
+
+    結構照抄 playwright_collect_boards，差別在引擎與人類化行為：
+    - 引擎優先順序：Patchright > Camoufox > 舊 Playwright（＋stealth 插件）。
+    - Chromium 引擎優先用使用者電腦上的真實 Chrome（channel='chrome'，
+      有登入、Cookie、歷史紀錄，最像真人），失敗再退回內建 Chromium。
+    - Camoufox 用 persistent_context=True + user_data_dir 沿用 profile，
+      並以 humanize=True 做人類曲線滑鼠移動。
+    - 人類化行為：看板之間隨機延遲、捲動分多步隨機步長加停頓、偶爾把
+      滑鼠移到隨機位置；用 cancel 檢查中斷。
+    - 照舊攔截 _api / service/api/v2 回應，用 parse_captured_responses
+      轉換；若某看板攔截不到任何 _api，再用 parse_next_data(page.content())
+      解析 __NEXT_DATA__ 當備援。
+    - 未安裝任何隱身引擎時 raise RuntimeError(STEALTH_INSTALL_MSG)。
+    本函式不碰 Tkinter，可在 worker 執行緒呼叫；cancel 為 threading.Event。
+    """
+    engine_ok, engine = stealth_available()
+    if not engine_ok:
+        raise RuntimeError(STEALTH_INSTALL_MSG)
+    if log is None:
+        log = lambda msg: None  # noqa: E731
+
+    def _cancelled():
+        return cancel is not None and cancel.is_set()
+
+    captured = []
+    seen_urls = set()
+    fallback_rows = []
+
+    def _on_response(response):
+        try:
+            url = response.url or ''
+        except Exception:
+            return
+        if not is_dcard_api_url(url):
+            return
+        try:
+            ctype = (response.headers.get('content-type') or '').lower()
+            if 'json' not in ctype:
+                return
+            data = response.json()
+        except Exception:
+            return
+        if url in seen_urls:
+            return
+        seen_urls.add(url)
+        captured.append((url, data))
+
+    def _human_scroll(page):
+        total = random.randint(1200, 3600)
+        for step in human_scroll_steps(total):
+            if _cancelled():
+                raise InterruptedError('已手動停止')
+            page.mouse.wheel(0, step)
+            page.wait_for_timeout(random.randint(400, 1200))
+
+    def _maybe_mouse_move(page):
+        if random.random() < 0.5:
+            try:
+                page.mouse.move(random.randint(100, 1100),
+                                random.randint(100, 800))
+            except Exception:
+                pass
+
+    def _collect_from_next_data(page, alias):
+        try:
+            rows = _posts_from_next_data(parse_next_data(page.content()), alias)
+        except Exception:
+            rows = []
+        if rows:
+            log(f'隱身瀏覽器：看板 {alias} 未攔截到 _api，'
+                f'改用 __NEXT_DATA__ 解析出 {len(rows)} 篇。')
+            fallback_rows.extend(rows)
+        return rows
+
+    def _browse_all(new_page):
+        for name, alias in selected:
+            if _cancelled():
+                raise InterruptedError('已手動停止')
+            log(f'隱身瀏覽器（{engine}）：正在開啟看板 {name} ({alias})…')
+            page = new_page()
+            page.on('response', _on_response)
+            try:
+                page.goto(f'{BASE}/f/{alias}', timeout=timeout * 1000,
+                          wait_until='domcontentloaded')
+                page.wait_for_timeout(2500)
+                _maybe_mouse_move(page)
+                steps = max(1, min(limit, 10))
+                for _ in range(steps):
+                    if _cancelled():
+                        raise InterruptedError('已手動停止')
+                    _human_scroll(page)
+                    human_delay(0.5, 1.5)
+                so_far, _ = parse_captured_responses(
+                    captured, selected=[(name, alias)],
+                    limit_per_board=limit,
+                    include_comments=include_comments)
+                if not so_far:
+                    so_far = _collect_from_next_data(page, alias)
+                for post in so_far[:limit]:
+                    if _cancelled():
+                        raise InterruptedError('已手動停止')
+                    pid = post['文章ID']
+                    try:
+                        page.goto(f'{BASE}/f/{alias}/p/{pid}',
+                                  timeout=timeout * 1000,
+                                  wait_until='domcontentloaded')
+                        page.wait_for_timeout(2000)
+                        _maybe_mouse_move(page)
+                        if include_comments:
+                            for _ in range(3):
+                                if _cancelled():
+                                    raise InterruptedError('已手動停止')
+                                _human_scroll(page)
+                                human_delay(0.5, 1.2)
+                    except InterruptedError:
+                        raise
+                    except Exception as exc:
+                        log(f'隱身瀏覽器：文章 {pid} 開啟失敗，已略過：{exc}')
+                        continue
+            except InterruptedError:
+                raise
+            except Exception as exc:
+                log(f'隱身瀏覽器：看板「{name}」瀏覽失敗：{exc}')
+            finally:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+            # 看板之間隨機延遲，避免固定節奏
+            human_delay(1.0, 3.0)
+
+    if engine == 'camoufox':
+        try:
+            cm = _camoufox_Camoufox(headless=not headed, humanize=True,
+                                    persistent_context=True,
+                                    user_data_dir=user_data_dir)
+        except TypeError:
+            # 舊版 Camoufox 不接受 persistent_context / user_data_dir
+            cm = _camoufox_Camoufox(headless=not headed, humanize=True)
+        with cm as context:
+            _browse_all(context.new_page)
+    else:
+        launcher = (_patchright_sync_playwright if engine == 'patchright'
+                    else sync_playwright)
+        with launcher() as pw:
+            try:
+                context = pw.chromium.launch_persistent_context(
+                    user_data_dir,
+                    headless=not headed,
+                    user_agent=UA,
+                    viewport={'width': 1280, 'height': 900},
+                    channel='chrome',
+                    args=['--disable-blink-features=AutomationControlled'],
+                )
+                log(f'隱身瀏覽器（{engine}）：使用使用者電腦上的真實 Chrome。')
+            except Exception as exc:
+                log(f'隱身瀏覽器（{engine}）：真實 Chrome 啟動失敗（{exc}），'
+                    '改用內建 Chromium。')
+                context = pw.chromium.launch_persistent_context(
+                    user_data_dir,
+                    headless=not headed,
+                    user_agent=UA,
+                    viewport={'width': 1280, 'height': 900},
+                    args=['--disable-blink-features=AutomationControlled'],
+                )
+            try:
+                def _new_page():
+                    pg = context.new_page()
+                    if engine == 'playwright':
+                        # 舊版 Playwright 才需要 stealth 插件，且只當備援
+                        _apply_stealth_sync(pg)
+                    return pg
+
+                _browse_all(_new_page)
+            finally:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+
+    posts, comments = parse_captured_responses(
+        captured, selected=selected, limit_per_board=limit,
+        include_comments=include_comments)
+    # 合併 __NEXT_DATA__ 備援解析出的貼文（去重、每看板不超過 limit）
+    if fallback_rows:
+        have = {p['文章ID'] for p in posts}
+        for row in fallback_rows:
+            if row['文章ID'] not in have:
+                have.add(row['文章ID'])
+                posts.append(row)
+        counts = {}
+        kept = []
+        for p in posts:
+            a = p.get('看板代碼') or ''
+            counts[a] = counts.get(a, 0) + 1
+            if counts[a] <= limit:
+                kept.append(p)
+        posts = kept
+        keep_ids = {p['文章ID'] for p in posts}
+        comments = [c for c in comments if c.get('文章ID') in keep_ids]
+    log(f'隱身瀏覽器（{engine}）：共攔截 {len(captured)} 個 _api 回應，'
+        f'解析出 {len(posts)} 篇文章、{len(comments)} 則留言。')
+    return posts, comments
+
+
 # ───────────────────── Oxylabs 付費 API（全自動備援，付費）─────────────────────
 OXYLABS_URL = 'https://realtime.oxylabs.io/v1/queries'
 
@@ -990,13 +1435,14 @@ def build_appendix(numbered, report):
 class DcardApp:
     def __init__(self, root):
         self.root = root
-        root.title('Dcard 文章與留言蒐集器 2.1（含 Gemini 趨勢分析）')
+        root.title('Dcard 文章與留言蒐集器 2.2（含 Gemini 趨勢分析）')
         root.geometry('1080x780')
         root.minsize(850, 620)
         self.q = queue.Queue()
         self.cancel = threading.Event()
         self.working = False
         self.installing_playwright = False
+        self.installing_stealth = False
         self.posts, self.comments = [], []
         self.forums = list(dict.fromkeys(DEFAULT_FORUMS))
         self.vars = {}
@@ -1009,7 +1455,7 @@ class DcardApp:
         self.cookie_var = StringVar(value='')
         self.oxylabs_user = StringVar(value='')
         self.oxylabs_pass = StringVar(value='')
-        self.status = StringVar(value='準備就緒。預設為「自動」模式：先試直接 _api，被擋時自動改用 Playwright，不需手動匯出 HAR。先選擇看板，再按「開始蒐集」。')
+        self.status = StringVar(value='準備就緒。預設為「自動」模式：先試直接 _api，被擋時自動改用隱身瀏覽器，不需手動匯出 HAR。先選擇看板，再按「開始蒐集」。')
         self.ai_cancel = threading.Event()
         self.api_key = StringVar(value=os.environ.get('GEMINI_API_KEY', ''))
         self.model = StringVar(value=MODEL_CHOICES[0])
@@ -1071,13 +1517,16 @@ class DcardApp:
         mode_row = ttk.Frame(cfg)
         mode_row.pack(fill='x', pady=(6, 0))
         ttk.Label(mode_row, text='蒐集模式：').pack(side='left')
-        ttk.Combobox(mode_row, values=['自動（建議）', '直接 _api', 'Playwright 自動瀏覽',
-                                       'Oxylabs 付費 API'],
+        ttk.Combobox(mode_row, values=['自動（建議）', '直接 _api', '隱身瀏覽器（建議）',
+                                       'Playwright 自動瀏覽', 'Oxylabs 付費 API'],
                      textvariable=self.mode, state='readonly', width=18).pack(side='left', padx=(2, 8))
         self.install_btn = ttk.Button(mode_row, text='安裝 Playwright（自動）',
                                       command=self.install_playwright)
         self.install_btn.pack(side='left')
-        ttk.Label(cfg, text='自動：先試直接 _api（再試 curl_cffi），被擋 403/429 時自動改用 Playwright，不需手動匯出 HAR。第一次用 Playwright 需先安裝一次。',
+        self.stealth_install_btn = ttk.Button(mode_row, text='安裝隱身瀏覽器（自動）',
+                                              command=self.install_stealth)
+        self.stealth_install_btn.pack(side='left', padx=(4, 0))
+        ttk.Label(cfg, text='自動：先試直接 _api（再試 curl_cffi），被擋 403/429 時自動改用隱身瀏覽器（Patchright／Camoufox，人類化瀏覽），再失敗才用舊 Playwright，不需手動匯出 HAR。第一次用隱身瀏覽器需先安裝一次。',
                   foreground='#536273', wraplength=620).pack(anchor='w', pady=(2, 0))
         ox_row = ttk.Frame(cfg)
         ox_row.pack(fill='x', pady=(6, 0))
@@ -1121,7 +1570,7 @@ class DcardApp:
         self.log_text.pack(fill='both', expand=True)
         self.tabs.add(log_page, text='執行紀錄')
         self.make_ai_tab()
-        ttk.Label(outer, text='提醒：預設「自動」模式被擋時會自動改用 Playwright，不需手動匯出 HAR。資料來自 Dcard，請合理使用、控制頻率，遵守 Dcard 使用條款。',
+        ttk.Label(outer, text='提醒：預設「自動」模式被擋時會自動改用隱身瀏覽器，不需手動匯出 HAR。資料來自 Dcard，請合理使用、控制頻率，遵守 Dcard 使用條款。',
                   foreground='#8b5b2b', wraplength=1000).pack(anchor='w', pady=(10, 0))
 
     def make_tree(self, title, columns):
@@ -1419,6 +1868,72 @@ class DcardApp:
                 self.installing_playwright = False
         threading.Thread(target=task, daemon=True).start()
 
+    def install_stealth(self):
+        """在背景執行緒安裝隱身瀏覽器（pip install patchright +
+        patchright install chromium），不凍結 UI。
+
+        完成後呼叫 reload_stealth() 重新偵測（v2.1 教訓：安裝後不需
+        重開程式）；若仍偵測不到，記錄使用的 sys.executable 並提示
+        關掉重開。Camoufox 需另外手動裝（見 STEALTH_INSTALL_MSG），
+        本按鈕只自動裝 Patchright。
+        """
+        if self.installing_stealth or self.working:
+            return
+        self.installing_stealth = True
+        try:
+            self.stealth_install_btn.config(state='disabled')
+        except Exception:
+            pass
+
+        def task():
+            try:
+                self.log(f'開始安裝隱身瀏覽器：pip install patchright…（使用 {sys.executable}）')
+                r1 = subprocess.run(
+                    [sys.executable, '-m', 'pip', 'install', 'patchright'],
+                    capture_output=True, text=True, timeout=600)
+                tail1 = (r1.stdout + r1.stderr)[-500:]
+                if r1.returncode != 0:
+                    self.log(f'pip install patchright 失敗（結束碼 {r1.returncode}）：{tail1}')
+                    self.q.put(('stealth_install_done', False))
+                    return
+                self.log('pip install patchright 完成，開始安裝 Chromium：patchright install chromium…')
+                r2 = subprocess.run(
+                    [sys.executable, '-m', 'patchright', 'install', 'chromium'],
+                    capture_output=True, text=True, timeout=900)
+                tail2 = (r2.stdout + r2.stderr)[-500:]
+                if r2.returncode != 0:
+                    self.log(f'patchright install chromium 失敗（結束碼 {r2.returncode}）：{tail2}')
+                    self.q.put(('stealth_install_done', False))
+                    return
+                # v2.1 教訓：安裝完立刻重新偵測，不需重開程式。
+                avail, engine = stealth_available()
+                if avail:
+                    self.log(f'隱身瀏覽器安裝完成：已重新偵測到 {engine}，'
+                             '不需重開程式，可直接按「開始蒐集」。')
+                else:
+                    try:
+                        r3 = subprocess.run(
+                            [sys.executable, '-c',
+                             'import patchright; print(patchright.__version__)'],
+                            capture_output=True, text=True, timeout=30)
+                        check = (r3.stdout + r3.stderr).strip()[-200:]
+                        self.log(f'安裝指令已完成，但本程式仍偵測不到隱身瀏覽器。'
+                                 f'用 {sys.executable} 檢查的結果：{check}。'
+                                 '請關閉本程式再重開一次；若仍不行，請確認啟動程式'
+                                 '用的 Python 和安裝用的 Python 是同一個。')
+                    except Exception as exc:
+                        self.log(f'安裝指令已完成，但本程式仍偵測不到隱身瀏覽器（{exc}）。'
+                                 '請關閉本程式再重開一次。')
+                self.log('隱身瀏覽器安裝完成：已安裝 patchright 與 Chromium，請再按「開始蒐集」。')
+                self.q.put(('stealth_install_done', True))
+            except Exception as exc:
+                self.log(f'安裝隱身瀏覽器發生錯誤：{exc}。請在終端機手動執行：'
+                         'pip install patchright；patchright install chromium')
+                self.q.put(('stealth_install_done', False))
+            finally:
+                self.installing_stealth = False
+        threading.Thread(target=task, daemon=True).start()
+
     # ── 蒐集 ──
     def start(self):
         if self.working:
@@ -1442,10 +1957,13 @@ class DcardApp:
                 'Oxylabs 付費 API 模式需要先在設定區輸入 Oxylabs 帳號與密碼\n'
                 '（只存在記憶體，不會存檔；Oxylabs 為付費服務，有免費試用）。')
             return
-        if mode in ('Playwright 自動瀏覽', '自動（建議）') and not playwright_available():
+        if mode in ('隱身瀏覽器（建議）', '自動（建議）') and not stealth_available()[0]:
+            self.log('提示：尚未安裝隱身瀏覽器（Patchright／Camoufox）。'
+                     '自動模式會先試直接 _api；若被擋，會提示安裝隱身瀏覽器。'
+                     '也可先按「安裝隱身瀏覽器（自動）」。')
+        elif mode == 'Playwright 自動瀏覽' and not playwright_available():
             self.log('提示：尚未安裝 Playwright。'
-                     '自動模式會先試直接 _api；若被擋，會提示安裝 Playwright。'
-                     '也可先按「安裝 Playwright（自動）」。')
+                     '可先按「安裝 Playwright（自動）」，或改用隱身瀏覽器模式。')
         self.cancel.clear()
         self.posts, self.comments = [], []
         self.post_iids = {}
@@ -1467,8 +1985,9 @@ class DcardApp:
         """蒐集總入口（在 worker 執行緒執行，絕不阻塞 UI）。
 
         自動模式：先試直接 _api；若被拒 403/429 且尚未取得任何文章，
-        自動改用 Playwright 自動瀏覽（Playwright 未安裝時明確提示安裝指令）。
-        直接 _api / Playwright / Oxylabs 模式則只走該模式。
+        自動改用隱身瀏覽器（Patchright／Camoufox）；隱身瀏覽器也失敗時
+        再退回舊 Playwright（未安裝任一瀏覽器引擎時明確提示安裝指令）。
+        直接 _api / 隱身瀏覽器 / Playwright / Oxylabs 模式則只走該模式。
         完成或失敗後一律經 finally 送出 idle，讓按鈕恢復。
         """
         try:
@@ -1476,6 +1995,9 @@ class DcardApp:
                 self.log('蒐集模式：Oxylabs 付費 API（經 Oxylabs 住宅 IP／瀏覽器抓取）。')
                 self._collect_oxylabs(selected, limit, include_comments, popular,
                                       ox_user, ox_pass)
+            elif mode == '隱身瀏覽器（建議）':
+                self.log('蒐集模式：隱身瀏覽器（Patchright／Camoufox，模擬人類瀏覽）。')
+                self._collect_stealth(selected, limit, include_comments, popular)
             elif mode == 'Playwright 自動瀏覽':
                 self.log('蒐集模式：Playwright 自動瀏覽（真實 Chromium，自己的電腦／IP）。')
                 self._collect_playwright(selected, limit, include_comments, popular)
@@ -1483,7 +2005,7 @@ class DcardApp:
                 self.log('蒐集模式：直接 _api。')
                 self._collect_direct(selected, limit, include_comments, popular)
             else:  # 自動（建議）
-                self.log('蒐集模式：自動——先試直接 _api，被擋時自動改用 Playwright。')
+                self.log('蒐集模式：自動——先試直接 _api，被擋時自動改用隱身瀏覽器，再失敗才用舊 Playwright。')
                 try:
                     self._collect_direct(selected, limit, include_comments, popular)
                 except AccessError as exc:
@@ -1491,12 +2013,26 @@ class DcardApp:
                         # 已有部分成果就不再切換，避免重複與混淆
                         self.log(f'直接 _api 中途被拒，已保留 {len(self.posts)} 篇文章：{exc}')
                         raise
-                    self.log(f'直接 _api 被拒（{exc}），自動切換到 Playwright 自動瀏覽…')
-                    if not playwright_available():
+                    self.log(f'直接 _api 被拒（{exc}），自動切換到隱身瀏覽器…')
+                    ok, engine = stealth_available()
+                    if ok:
+                        try:
+                            self._collect_stealth(selected, limit, include_comments, popular)
+                        except RuntimeError as sexc:
+                            self.log(f'隱身瀏覽器失敗（{sexc}），再改用舊 Playwright…')
+                            if not playwright_available():
+                                raise RuntimeError(
+                                    '直接 _api 被拒，隱身瀏覽器也沒有取得文章，'
+                                    '且尚未安裝舊版 Playwright。\n\n'
+                                    + STEALTH_INSTALL_MSG)
+                            self._collect_playwright(selected, limit, include_comments, popular)
+                    elif playwright_available():
+                        self.log('尚未安裝隱身瀏覽器，改用舊 Playwright…')
+                        self._collect_playwright(selected, limit, include_comments, popular)
+                    else:
                         raise RuntimeError(
-                            '直接 _api 被拒，且尚未安裝 Playwright，無法自動切換。\n\n'
-                            + PLAYWRIGHT_INSTALL_MSG)
-                    self._collect_playwright(selected, limit, include_comments, popular)
+                            '直接 _api 被拒，且尚未安裝隱身瀏覽器或 Playwright，無法自動切換。\n\n'
+                            + STEALTH_INSTALL_MSG)
         except InterruptedError as e:
             self.log(str(e))
         except AccessError as e:
@@ -1528,6 +2064,17 @@ class DcardApp:
             self.q.put(('comment', row))
         if posts:
             self.log(f'已取得 {len(posts)} 篇文章、{len(comments)} 則留言')
+
+    def _collect_stealth(self, selected, limit, include_comments, popular):
+        posts, comments = stealth_collect_boards(
+            selected, limit, include_comments, popular,
+            cancel=self.cancel, log=self.log)
+        if not posts:
+            raise RuntimeError(
+                '隱身瀏覽器沒有取得任何文章：可能是 Cloudflare 仍在阻擋此網路，'
+                '或看板頁面沒有載入。請改用 Oxylabs 付費 API 模式；'
+                '最後的手動備援是「匯入 HAR 檔案…」。')
+        self._emit_posts_comments(posts, comments)
 
     def _collect_playwright(self, selected, limit, include_comments, popular):
         posts, comments = playwright_collect_boards(
@@ -1985,6 +2532,29 @@ class DcardApp:
                     self.status.set(f'Gemini 連線成功，已載入 {len(data)} 個可用模型。')
                 elif kind == 'ai_msg':
                     messagebox.showwarning('Dcard', data)
+                elif kind == 'stealth_install_done':
+                    ok = bool(data)
+                    try:
+                        self.stealth_install_btn.config(state='normal')
+                    except Exception:
+                        pass
+                    # v2.1 教訓：安裝指令完成不代表本程式已偵測到，重新檢查一次。
+                    if ok:
+                        avail, engine = stealth_available()
+                        if not avail:
+                            self.status.set('安裝指令已完成，但本程式仍偵測不到隱身瀏覽器，請關閉程式再重開一次。')
+                            messagebox.showwarning(
+                                '請重開程式',
+                                '安裝指令已完成，但本程式仍偵測不到隱身瀏覽器（Patchright）。\n\n'
+                                '請先關閉本程式再重開一次，然後按「開始蒐集」。\n'
+                                '若重開後仍不行，請確認啟動程式用的 Python 和安裝用的\n'
+                                'Python 是同一個（執行紀錄有寫使用的 Python 路徑）。')
+                        else:
+                            self.status.set(f'隱身瀏覽器安裝完成（{engine}），請按「開始蒐集」。')
+                            messagebox.showinfo('安裝完成', f'隱身瀏覽器已安裝完成（引擎：{engine}），請再按「開始蒐集」。')
+                    else:
+                        self.status.set('隱身瀏覽器安裝失敗，請看執行紀錄，或在終端機手動執行 pip install patchright；patchright install chromium。')
+                        messagebox.showwarning('安裝失敗', '隱身瀏覽器安裝失敗，請看「執行紀錄」，或在終端機手動執行：\n\npip install patchright\npatchright install chromium')
                 elif kind == 'install_done':
                     ok = bool(data)
                     try:

@@ -15,14 +15,18 @@
 - **蒐集設定**：每個看板 1～200 篇（預設 10 篇）、最新／熱門篩選、
   是否同步抓留言（每篇最多 500 則）、請求間隔 0.8 秒、每看板最多翻 40 頁，
   可隨時停止，進度條與執行紀錄即時顯示。
-- **蒐集模式（2.0 版，全自動）**：設定區有「蒐集模式」下拉選單，預設
+- **蒐集模式（2.2 版，全自動）**：設定區有「蒐集模式」下拉選單，預設
   「自動（建議）」——先試直接 `_api`（再試一次 curl_cffi），被 Cloudflare
-  擋 403/429 時自動改用 Playwright 真實瀏覽器繼續抓，**使用者只要按
-  「開始蒐集」，不需自己逛 Dcard、不用匯出 HAR**。另可選「直接 _api」、
-  「Playwright 自動瀏覽」、「Oxylabs 付費 API」。
-- **安裝 Playwright（自動）**：設定區的按鈕會在背景自動跑
-  `pip install playwright` 與 `playwright install chromium`，裝一次即可，
-  不會凍結介面；失敗時執行紀錄會提示手動指令。
+  擋 403/429 時自動改用隱身瀏覽器繼續抓，再失敗才退回舊 Playwright，
+  **使用者只要按「開始蒐集」，不需自己逛 Dcard、不用匯出 HAR**。另可選
+  「直接 _api」、「隱身瀏覽器（建議）」、「Playwright 自動瀏覽」、
+  「Oxylabs 付費 API」。
+- **安裝隱身瀏覽器（自動）**：設定區的按鈕會在背景自動跑
+  `pip install patchright` 與 `patchright install chromium`，裝一次即可，
+  不會凍結介面；裝完會立刻重新偵測，不需重開程式。Camoufox 需手動安裝
+  （`pip install camoufox[geoip]` 再跑 `python -m camoufox fetch`）。
+  舊的「安裝 Playwright（自動）」按鈕仍保留。
+- **隱身瀏覽器模式（2.2）**：詳見下方「隱身瀏覽器模式（2.2）」一節。
 - **Dcard API 客戶端**：`requests.Session`，UA 為 Chrome、Accept 為
   `application/json`、Referer 為 `https://www.dcard.tw/`，逾時 20 秒，
   5xx／網路錯誤重試 3 次；403／429 時先試一次 curl_cffi，自動模式再
@@ -109,13 +113,13 @@ forumAlias／forumName、anonymous、gender、school。
 
 ## 全自動模式（不用手動逛、不用匯出 HAR）
 
-2.0 版的預設就是全自動。使用者在自己的電腦上只要做兩件事：
+2.2 版的預設就是全自動。使用者在自己的電腦上只要做兩件事：
 
-1. **安裝 Playwright 一次**：按工具設定區的「安裝 Playwright（自動）」，
+1. **安裝隱身瀏覽器一次**：按工具設定區的「安裝隱身瀏覽器（自動）」，
    或在終端機執行：
    ```bash
-   pip install playwright
-   playwright install chromium
+   pip install patchright
+   patchright install chromium
    ```
 2. **按「開始蒐集」**：不用自己開 Chrome 逛 Dcard、不用匯出 HAR。
 
@@ -123,37 +127,81 @@ forumAlias／forumName、anonymous、gender、school。
 
 1. 先用直接 `_api`（`requests`）抓看板文章列表、全文與留言；
    收到 403/429 時，先試一次 `curl_cffi`（chrome131 TLS 偽裝）。
-2. 若直接方式被拒且尚未取得任何文章，**自動切換到 Playwright 自動瀏覽**，
-   執行紀錄會寫「直接 _api 被拒，自動切換到 Playwright 自動瀏覽…」。
-3. Playwright 會在自己的電腦上，用持續性 Chrome profile（`./dcard_profile`）
-   開一個真實 Chromium，依序開啟每個看板的頁面、捲動觸發 `_api/posts`
-   請求，再逐篇開啟文章頁觸發內文與留言請求，全程攔截 `_api` 回應並
-   轉成文章與留言，顯示在預覽、匯出 Excel、做 Gemini 分析。
-4. 若 Playwright 也沒有取得任何文章，工具會明確報錯，並建議改用
-   Oxylabs 付費 API 模式；最後的手動備援才是「匯入 HAR 檔案…」。
+2. 若直接方式被拒且尚未取得任何文章，**自動切換到隱身瀏覽器**，
+   執行紀錄會寫「直接 _api 被拒，自動切換到隱身瀏覽器…」。
+3. 隱身瀏覽器會在自己的電腦上，用持續性 Chrome profile（`./dcard_profile`）
+   開一個隱身瀏覽器，依序開啟每個看板的頁面、用人類化的方式捲動觸發
+   `_api/posts` 請求，再逐篇開啟文章頁觸發內文與留言請求，全程攔截
+   `_api` 回應並轉成文章與留言，顯示在預覽、匯出 Excel、做 Gemini 分析。
+4. 若隱身瀏覽器也失敗，自動模式再退回舊 Playwright；若兩者都沒有取得
+   任何文章，工具會明確報錯，並建議改用 Oxylabs 付費 API 模式；
+   最後的手動備援才是「匯入 HAR 檔案…」。
 
-### 為什麼 Playwright 在直接請求失敗時還能通
+## 隱身瀏覽器模式（2.2）
+
+### 為什麼普通 Playwright 不夠
 
 直接 `requests` 失敗的主因不是程式寫錯，而是 Cloudflare 擋了
-「資料中心 IP＋程式發出的 TLS 指紋」這種組合。Playwright 用的是
-**使用者自己電腦上的真實 Chromium、自己的家用 IP、自己的瀏覽器
-工作階段**，跟平常開 Chrome 逛 Dcard 是一樣的身分，Cloudflare 會把
-它當成一般使用者，並把通過紀錄存在 `./dcard_profile`，下次再開就
-不用重新通過。第一次開啟時若 Dcard 要求登入，請在瀏覽器視窗中登入
-一次（可用 `--headed` 或在工具的 Playwright 模式下觀察），之後
-profile 會記住。
+「資料中心 IP＋程式發出的 TLS 指紋」這種組合。普通 Playwright 雖然用
+的是真實瀏覽器，但仍會漏出 automation 訊號（例如 `navigator.webdriver`、
+CDP 控制通道、TLS 指紋），在嚴格的環境下還是可能被認出來。
 
-### 若 Playwright 也被擋
+### 三種引擎，依優先順序
+
+| 優先順序 | 引擎 | 做法 | 安裝 |
+| --- | --- | --- | --- |
+| 1（首選） | **Patchright** | 改過的 Playwright，API 與 Playwright 完全相同，drop-in 替換，不漏 automation 訊號 | `pip install patchright`；`patchright install chromium`（或按工具裡的「安裝隱身瀏覽器（自動）」） |
+| 2（次選） | **Camoufox** | 改過的 Firefox，指紋在 C++ 層注入（不是執行時打補丁），`humanize=True` 會做人類曲線滑鼠移動 | `pip install camoufox[geoip]`；`python -m camoufox fetch`（需手動裝，工具按鈕只裝 Patchright） |
+| 3（最後備援） | 舊版 Playwright | 原本的 Playwright，另加 `playwright-stealth` 插件 | `pip install playwright`；`playwright install chromium` |
+
+程式會自動偵測已安裝的引擎，依 Patchright → Camoufox → Playwright 的
+順序選用；安裝後立刻重新偵測，不需重開程式（2.1 修過的 bug 不會重演）。
+
+**為什麼不用 `playwright-stealth` 當主力：** 它只是執行時打補丁的插件，
+已有未解決的偵測問題，對 Cloudflare 的 Managed Challenge 不可靠。
+本工具只在舊版 Playwright 引擎時把它當最後備援自動套用，不要只依賴它。
+`nodriver`（直接走 CDP、不走 WebDriver）也是同級做法，但本工具以
+Playwright 相容的 Patchright／Camoufox 為主，程式結構不用重寫。
+
+### 用真實 Chrome + 人類化行為
+
+- **優先用你電腦上的真實 Chrome**：Chromium 引擎會先試 `channel='chrome'`
+  開你自己的 Chrome（有登入、Cookie、歷史紀錄，最像真人），失敗才退回
+  內建 Chromium。Camoufox 則用 `persistent_context=True` 沿用
+  `./dcard_profile`。
+- **人類化行為**：看板之間隨機延遲 1–3 秒、捲動分多步隨機步長
+  （300–700px 一步）加停頓、偶爾把滑鼠移到隨機位置；不用固定節奏。
+- **非 API 備援 `__NEXT_DATA__`**：Dcard 看板／文章頁是 Next.js，整頁資料
+  嵌在 `<script id="__NEXT_DATA__">` 裡。若某看板攔截不到任何 `_api` 回應，
+  工具會改用 `parse_next_data()` 解析這段 JSON 當備援，不用打 `_api`、
+  不用執行 JS。
+
+### 沒有 100% 保證
+
+這是軍備競賽：這些工具今天有效，不代表永遠有效，Cloudflare 隨時可能
+更新偵測方式。IP 仍是關鍵——隱身瀏覽器不會隱藏你的 IP，在家用／手機
+網路上成功率最高，資料中心 IP 仍可能被擋。請控制頻率、不要短時間大量
+抓取；若隱身瀏覽器也被擋，剩下的全自動備援是 Oxylabs 付費 API 模式。
+
+### 為什麼隱身瀏覽器在直接請求失敗時還能通
+
+隱身瀏覽器用的是**使用者自己電腦上的真實瀏覽器、自己的家用 IP、
+自己的瀏覽器工作階段**，跟平常開 Chrome 逛 Dcard 是一樣的身分，
+Cloudflare 會把它當成一般使用者，並把通過紀錄存在 `./dcard_profile`，
+下次再開就不用重新通過。第一次開啟時若 Dcard 要求登入，請在瀏覽器
+視窗中登入一次，之後 profile 會記住。
+
+### 若隱身瀏覽器也被擋
 
 在極少數網路環境（例如公司／學校的出口 IP 也被列入黑名單），
-Playwright 也可能被擋。此時唯一剩下的**全自動**備援是
+隱身瀏覽器也可能被擋。此時唯一剩下的**全自動**備援是
 「Oxylabs 付費 API」模式：把請求交給 Oxylabs 的住宅 IP／瀏覽器去抓，
 帳號密碼只存在記憶體，Oxylabs 有免費試用。HAR 匯入則是最後的
 手動備援——它一定可用，因為資料是你自己的瀏覽器正常載入的，
 只是要你自己逛、自己匯出。
 
 **注意：** 本專案的作者沒有在雲端 VM 上實測過真實 Dcard 擷取
-（該環境的 IP 已被 Cloudflare 擋 403），Playwright 模式請務必在
+（該環境的 IP 已被 Cloudflare 擋 403），隱身瀏覽器模式請務必在
 使用者自己的電腦上驗證一次。
 
 ## 確切可用的方法（已實測）
@@ -163,9 +211,9 @@ Playwright 也可能被擋。此時唯一剩下的**全自動**備援是
 
 | 排名 | 方法 | 實測結果 | 成本 |
 | --- | --- | --- | --- |
-| 1 | **自動模式（本工具預設）** | 直接 `_api` 被擋時自動改用 Playwright 真實瀏覽器，全程不需手動操作；第一次需安裝 Playwright 一次 | 免費 |
+| 1 | **自動模式（本工具預設）** | 直接 `_api` 被擋時自動改用隱身瀏覽器（Patchright／Camoufox），再失敗才用舊 Playwright，全程不需手動操作；第一次需安裝隱身瀏覽器一次 | 免費 |
 | 2 | **在家用／手機網路直接用 `_api`** | 最簡單免費。在自己的電腦、家用或手機網路上通常可達；雲端／資料中心 IP 會被 Cloudflare 擋 403 | 免費 |
-| 3 | **Playwright 用自己的 Chrome profile 擷取 `_api`** | 在自己電腦上最穩的自動化方式。主程式已內建（自動／Playwright 模式），另見 `capture_dcard_playwright.py`：用持續性 profile 開 Chromium，監聽 `/_api/` 回應存成 JSON。不要在雲端 VM 上跑，一定會被擋 | 免費 |
+| 3 | **隱身瀏覽器用自己的 Chrome profile 擷取 `_api`** | 在自己電腦上最穩的自動化方式。主程式已內建（自動／隱身瀏覽器模式），另見 `capture_dcard_playwright.py`：用持續性 profile 開 Chromium，監聽 `/_api/` 回應存成 JSON。不要在雲端 VM 上跑，一定會被擋 | 免費 |
 | 4 | **HAR 匯入（本工具「匯入 HAR 檔案…」）** | **保證可用，但要手動操作**。在自己的 Chrome 逛 Dcard，F12 → Network → 勾 Preserve log → 右鍵 Save all as HAR with content，再匯入本工具。不需繞過任何防護，因為資料是你自己的瀏覽器正常載入的 | 免費 |
 | 5 | **curl_cffi（TLS 偽裝）** | 已實測：chrome131 與 chrome120 在被擋的 IP 上**也還是 403**。TLS 指紋不是主因，IP 信譽才是。本工具 403 時會自動試一次，失敗就明確提示，不會無限重試 | 免費（選用） |
 | 6 | **付費爬蟲 API（Oxylabs 模式已內建）** | Oxylabs Web Scraper API 有 Dcard 專用 source；Firecrawl、ScrapingBee、ScraperAPI 等可處理 Cloudflare；另有 omniscrape.dev 的 Dcard 專用 API。適合不想自己處理防護、願意付費的情況 | 付費 |
@@ -184,13 +232,13 @@ Playwright 也可能被擋。此時唯一剩下的**全自動**備援是
 
 ## Playwright 擷取步驟
 
-2.0 版起，主程式已內建 Playwright（自動／Playwright 模式），一般使用
-不需要另外跑腳本。第一次使用前，按工具裡的「安裝 Playwright（自動）」，
-或在終端機執行：
+2.0 版起，主程式已內建 Playwright（自動／Playwright 模式），2.2 版起
+預設改用隱身瀏覽器（自動／隱身瀏覽器模式），一般使用不需要另外跑腳本。
+第一次使用前，按工具裡的「安裝隱身瀏覽器（自動）」，或在終端機執行：
 
 ```bash
-pip install playwright
-playwright install chromium
+pip install patchright
+patchright install chromium
 ```
 
 獨立腳本仍保留，方便在終端機單獨擷取、除錯：
@@ -207,15 +255,16 @@ python capture_dcard_playwright.py --forum relationship --posts 20 --headed
 ## Cloudflare 403 疑難排解
 
 從某些伺服器／資料中心 IP 直接請求 `_api`，可能被 Cloudflare 回 403。
-**2.0 版起，請依下列順序處理——前兩項都是全自動，不需手動匯出 HAR：**
+**2.2 版起，請依下列順序處理——前三項都是全自動，不需手動匯出 HAR：**
 
 1. **自動模式（預設，最優先）**：確認蒐集模式是「自動（建議）」，直接按
-   「開始蒐集」。工具會先試直接 `_api`，被擋就自動改用 Playwright。
-   若 Playwright 尚未安裝，請先按「安裝 Playwright（自動）」裝一次。
-2. **Playwright 模式**：若自動模式仍沒有取得文章，改選「Playwright 自動瀏覽」
-   再按一次「開始蒐集」，跳過直接 `_api`，直接用真實瀏覽器抓。
+   「開始蒐集」。工具會先試直接 `_api`，被擋就自動改用隱身瀏覽器，
+   再失敗才用舊 Playwright。
+   若隱身瀏覽器尚未安裝，請先按「安裝隱身瀏覽器（自動）」裝一次。
+2. **隱身瀏覽器模式**：若自動模式仍沒有取得文章，改選「隱身瀏覽器（建議）」
+   再按一次「開始蒐集」，跳過直接 `_api`，直接用隱身瀏覽器抓。
    第一次開啟時若 Dcard 要求登入，請在瀏覽器視窗中登入一次，profile 會記住。
-3. **Oxylabs 付費 API 模式**：若 Playwright 也被擋（例如出口 IP 也被列入
+3. **Oxylabs 付費 API 模式**：若隱身瀏覽器也被擋（例如出口 IP 也被列入
    黑名單），改選「Oxylabs 付費 API」並填入帳號密碼，經 Oxylabs 的住宅
    IP／瀏覽器抓取。
 4. **更換網路**：改用家用／手機網路等非資料中心 IP，再按「測試 Dcard 連線」。
@@ -291,6 +340,7 @@ python3 capture_dcard_playwright.py --help
 ```
 
 注意：測試只測純函式（解析、HAR／Playwright 攔截資料轉換、Oxylabs 回傳
-解析、Playwright 未安裝時的報錯），不發真實 Dcard 請求、不啟動瀏覽器。
+解析、Playwright 未安裝時的報錯、隱身瀏覽器引擎偵測、人類化捲動步長、
+`__NEXT_DATA__` 解析），不發真實 Dcard 請求、不啟動瀏覽器。
 真實 Dcard 擷取沒有在雲端 VM 上測試過（該環境 IP 已被 Cloudflare 擋 403），
-Playwright 模式請在自己的電腦上驗證一次。
+隱身瀏覽器模式請在自己的電腦上驗證一次。

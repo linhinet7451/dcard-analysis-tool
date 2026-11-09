@@ -6,6 +6,11 @@ IP 信譽才是。所以最穩的自動化方式，是在自己的電腦、用�
 profile 真的去逛 Dcard，讓瀏覽器自己發出 _api 請求，再把回應存下來，
 之後用 dcard_desktop.py 的「匯入 HAR 檔案…」或直接讀這些 JSON 來分析。
 
+2.0 版起，主程式已把 Playwright 直接整合進「自動（建議）」與
+「Playwright 自動瀏覽」模式（見 dcard_desktop.py 的 playwright_collect_boards），
+按「開始蒐集」就會自動用，不必另外跑本腳本；本腳本保留為獨立工具，方便
+在終端機單獨擷取、除錯。
+
 用法（在自己的電腦上，不要在雲端 VM 上跑，一定會被擋）：
     pip install playwright
     playwright install chromium

@@ -10,11 +10,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from capture_dcard_playwright import is_dcard_api_url, capture_filename
+import dcard_desktop
 from dcard_desktop import (
     parse_forums, parse_posts, parse_post_detail, parse_comments,
     format_dcard_time, author_label, safe_excel, build_batch_prompt,
     parse_har_entries, parse_har_data, classify_dcard_har_url,
     curl_cffi_available, curl_cffi_get_json,
+    is_dcard_api_url as is_dcard_api_url_desktop,
+    playwright_available, playwright_collect_boards,
+    parse_captured_responses, parse_oxylabs_result, oxylabs_fetch_json,
+    PLAYWRIGHT_INSTALL_MSG, OXYLABS_URL,
     SAMPLE_POSTS, SAMPLE_COMMENTS, POST_COLS, COMMENT_COLS,
 )
 
@@ -253,6 +258,108 @@ def test_playwright_capture_url_matching():
     assert not is_dcard_api_url("")
     assert capture_filename("20261109_120000", 1) == "20261109_120000_001.json"
     assert capture_filename("20261109_120000", 12) == "20261109_120000_012.json"
+
+
+def test_is_dcard_api_url_desktop():
+    # dcard_desktop 內建的版本須與獨立腳本一致
+    for url, expected in [
+        ("https://www.dcard.tw/_api/forums", True),
+        ("https://www.dcard.tw/_api/posts/111/comments?after=0", True),
+        ("https://www.dcard.tw/service/api/v2/forums/food/posts", True),
+        ("https://www.dcard.tw/f/food", False),
+        ("https://www.google.com/_api/forums", False),
+        ("", False),
+    ]:
+        assert is_dcard_api_url_desktop(url) == expected, url
+        assert is_dcard_api_url(url) == expected, url
+    assert isinstance(playwright_available(), bool)
+
+
+def test_parse_captured_responses():
+    # Playwright 攔截到的 (url, data)，用 list 與 dict 兩種形式都要能解析
+    captured_list = [
+        ("https://www.dcard.tw/_api/forums/food/posts?popular=false&limit=30",
+         SAMPLE_POSTS_JSON[:1]),
+        ("https://www.dcard.tw/_api/posts/123/comments?after=0&limit=30",
+         SAMPLE_COMMENTS_JSON),
+    ]
+    posts, comments = parse_captured_responses(
+        captured_list, selected=[("美食", "food")], limit_per_board=10)
+    assert len(posts) == 1 and posts[0]["文章ID"] == "123", posts
+    assert [c["樓層"] for c in comments] == [1, 2], comments
+    for p in posts:
+        for col in POST_COLS:
+            assert col in p
+    # dict 形式
+    posts2, comments2 = parse_captured_responses(
+        dict(captured_list), selected=[("美食", "food")])
+    assert len(posts2) == 1 and len(comments2) == 2
+    # 不抓留言時留言為空；看板篩選會擋掉不相符的貼文
+    posts3, comments3 = parse_captured_responses(
+        captured_list, selected=[("美食", "food")], include_comments=False)
+    assert len(posts3) == 1 and comments3 == []
+    posts4, _ = parse_captured_responses(
+        captured_list, selected=[("旅遊", "travel")])
+    assert posts4 == []
+    # 每看板上限：3 篇只留前 2 篇（依攔截順序）
+    many = [("https://www.dcard.tw/_api/forums/food/posts",
+             [{"id": str(i), "title": f"第{i}篇", "excerpt": "x",
+               "createdAt": "2026-11-09T10:00:00.000Z", "likeCount": 1,
+               "commentCount": 0, "forumAlias": "food", "forumName": "美食",
+               "anonymous": True} for i in (1, 2, 3)])]
+    posts5, _ = parse_captured_responses(
+        many, selected=[("美食", "food")], limit_per_board=2)
+    assert [p["文章ID"] for p in posts5] == ["1", "2"], posts5
+    assert parse_captured_responses([]) == ([], [])
+    assert parse_captured_responses(None) == ([], [])
+
+
+def test_playwright_collect_boards_missing():
+    # 不啟動瀏覽器：把 guarded import 旗標暫時設為 None，必須明確報安裝指令
+    original = dcard_desktop.sync_playwright
+    try:
+        dcard_desktop.sync_playwright = None
+        assert playwright_available() is False
+        try:
+            playwright_collect_boards([("美食", "food")], 10, True, False)
+            raise AssertionError("未安裝 Playwright 時應 raise RuntimeError")
+        except RuntimeError as exc:
+            assert "pip install playwright" in str(exc), str(exc)
+            assert "playwright install chromium" in str(exc), str(exc)
+    finally:
+        dcard_desktop.sync_playwright = original
+    assert "pip install playwright" in PLAYWRIGHT_INSTALL_MSG
+
+
+def test_parse_oxylabs_result():
+    assert OXYLABS_URL == "https://realtime.oxylabs.io/v1/queries"
+    # content 已是 dict / list 時直接回傳
+    assert parse_oxylabs_result({"results": [{"content": {"a": 1}}]}) == {"a": 1}
+    assert parse_oxylabs_result({"results": [{"content": [1, 2]}]}) == [1, 2]
+    # content 是 JSON 字串時解析
+    assert parse_oxylabs_result(
+        {"results": [{"content": json.dumps([{"id": "1", "title": "t"}])}]}) == [
+        {"id": "1", "title": "t"}]
+    # 缺 results / content / 不是 JSON 時明確報錯，不可靜默回空
+    for bad in ({}, {"results": []}, {"results": [{}]},
+                {"results": [{"content": ""}]},
+                {"results": [{"content": "<html>blocked</html>"}]},
+                {"results": "nope"}, "nope"):
+        try:
+            parse_oxylabs_result(bad)
+            raise AssertionError(f"應報錯：{bad!r}")
+        except RuntimeError:
+            pass
+
+
+def test_oxylabs_fetch_json_missing_credentials():
+    # 帳號密碼缺失時不發任何網路請求，直接報錯
+    for user, pw in (("", ""), ("user", ""), ("", "pass")):
+        try:
+            oxylabs_fetch_json("https://www.dcard.tw/_api/forums", user, pw)
+            raise AssertionError("缺帳號密碼時應 raise RuntimeError")
+        except RuntimeError as exc:
+            assert "Oxylabs" in str(exc), str(exc)
 
 
 def test_sample_demo_data():

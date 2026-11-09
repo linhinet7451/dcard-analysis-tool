@@ -1,5 +1,11 @@
 """Dcard 文章與留言蒐集桌面工具（讀取 Dcard 內部 _api）。
 
+2.0 全自動模式：預設「自動（建議）」會先試直接 _api（requests，再試一次
+curl_cffi），被 Cloudflare 擋 403/429 時自動切換到 Playwright 自動瀏覽
+（在使用者自己的電腦、用自己的 Chrome profile 真的去逛 Dcard），
+使用者只要按「開始蒐集」，不需手動逛 Dcard、不用匯出 HAR。
+若 Playwright 也被擋，最後的全自動備援是 Oxylabs 付費 API 模式。
+
 與 PTT 工具相同的結構與使用方式，資料來源改為 Dcard：
   https://www.dcard.tw/_api/forums
   https://www.dcard.tw/_api/forums/{alias}/posts?popular=false&limit=30&before={postId}
@@ -9,16 +15,15 @@
 注意：Dcard 前方有 Cloudflare，直接從資料中心 IP 請求 _api 可能回 403。
 已實測：plain requests、curl_cffi（chrome131 / chrome120）與真實瀏覽器
 在被擋的 IP 上都會 403，TLS 偽裝不是主因，IP 信譽才是。
-本工具遇到 403/429 會先試一次 curl_cffi（若有安裝），再明確提示並停止；
-確切可用的做法是 HAR 匯入（在自己的 Chrome 逛 Dcard 後匯出 HAR 再匯入）
-與 Playwright 擷取（見 capture_dcard_playwright.py），詳見 README。
-API Key 與 Cookie 只存在記憶體，絕不寫入檔案或 Excel。
+API Key、Cookie 與 Oxylabs 帳號密碼只存在記憶體，絕不寫入檔案或 Excel。
 """
 import base64
 import json
 import os
 import queue
 import re
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
@@ -36,6 +41,18 @@ try:
     from curl_cffi import requests as _curl_requests
 except Exception:  # ImportError 等，一律視為未安裝，不讓主程式崩潰
     _curl_requests = None
+
+try:
+    # 選用依賴：未安裝時為 None，Playwright 模式會明確提示安裝指令。
+    from playwright.sync_api import sync_playwright
+except Exception:
+    sync_playwright = None
+
+PLAYWRIGHT_INSTALL_MSG = (
+    '尚未安裝 Playwright，請先安裝一次（只需裝一次）：\n'
+    '  pip install playwright\n'
+    '  playwright install chromium\n'
+    '或在本工具按「安裝 Playwright（自動）」。')
 
 BASE = 'https://www.dcard.tw'
 API_BASE = 'https://www.dcard.tw/_api'
@@ -434,6 +451,247 @@ def parse_har_data(har):
     return parse_har_entries(entries)
 
 
+# ───────────────────── Playwright 自動瀏覽（全自動備援）─────────────────────
+def is_dcard_api_url(url):
+    """是否為 Dcard API 回應（_api 或 service/api/v2）。純函式，可單獨測試。"""
+    url = url or ''
+    return 'dcard.tw' in url and ('/_api/' in url or '/service/api/v2/' in url)
+
+
+def playwright_available():
+    """Playwright 是否可用。未安裝時回 False，絕不拋錯。"""
+    return sync_playwright is not None
+
+
+def parse_captured_responses(captured, selected=None, limit_per_board=None,
+                             include_comments=True):
+    """把 Playwright 攔截到的 _api 回應轉成 (posts, comments)。
+
+    captured 可為 [(url, data), ...] 或 {url: data}。做法是把每一筆包成
+    HAR 條目後重用 parse_har_entries，不重寫解析邏輯。
+    selected 為 [(看板名稱, alias), ...] 時只保留這些看板的貼文；
+    limit_per_board 為每看板上限篇數；include_comments=False 時不回傳留言；
+    留言每篇最多保留 500 則（依樓層順序）。
+    """
+    entries = []
+    items = captured.items() if isinstance(captured, dict) else (captured or [])
+    for url, data in items:
+        try:
+            text = json.dumps(data, ensure_ascii=False)
+        except (TypeError, ValueError):
+            continue
+        entries.append({'request': {'url': url or ''},
+                        'response': {'content': {'text': text}}})
+    posts, comments = parse_har_entries(entries)
+    if selected:
+        aliases = {a for _, a in selected}
+        posts = [p for p in posts if p.get('看板代碼') in aliases]
+        keep_ids = {p['文章ID'] for p in posts}
+        comments = [c for c in comments if c.get('文章ID') in keep_ids]
+    if limit_per_board:
+        counts = {}
+        kept = []
+        for p in posts:
+            alias = p.get('看板代碼') or ''
+            counts[alias] = counts.get(alias, 0) + 1
+            if counts[alias] <= limit_per_board:
+                kept.append(p)
+        posts = kept
+        keep_ids = {p['文章ID'] for p in posts}
+        comments = [c for c in comments if c.get('文章ID') in keep_ids]
+    if not include_comments:
+        return posts, []
+    trimmed = []
+    per_post = {}
+    for c in comments:
+        pid = c.get('文章ID')
+        per_post[pid] = per_post.get(pid, 0) + 1
+        if per_post[pid] <= MAX_COMMENTS_PER_POST:
+            trimmed.append(c)
+    return posts, trimmed
+
+
+def playwright_collect_boards(selected, limit, include_comments, popular,
+                              user_data_dir='./dcard_profile', headed=False,
+                              timeout=30, cancel=None, log=None):
+    """用 Playwright 真實瀏覽器自動蒐集 Dcard，完全不需使用者手動操作。
+
+    在使用者自己的電腦上，用持續性 Chrome profile（./dcard_profile，
+    會沿用 Cloudflare 通過紀錄與登入狀態）開啟各看板頁面、捲動觸發
+    _api/posts 請求，再逐篇開啟文章頁觸發 /posts/{id} 與留言請求，
+    攔截所有 _api 回應後轉成 (posts, comments)。
+    popular 目前僅影響日誌說明（看板頁本身即會載入熱門／最新列表，
+    以實際攔截到的回應為準）。
+
+    未安裝 Playwright 時 raise RuntimeError（附完整安裝指令），絕不
+    讓 import 失敗或瀏覽器啟動錯誤變成難懂的 traceback。
+    本函式不碰 Tkinter，可在 worker 執行緒呼叫；cancel 為 threading.Event。
+    """
+    if sync_playwright is None:
+        raise RuntimeError(PLAYWRIGHT_INSTALL_MSG)
+    if log is None:
+        log = lambda msg: None  # noqa: E731
+
+    def _cancelled():
+        return cancel is not None and cancel.is_set()
+
+    captured = []
+    seen_urls = set()
+
+    def _on_response(response):
+        try:
+            url = response.url or ''
+        except Exception:
+            return
+        if not is_dcard_api_url(url):
+            return
+        try:
+            ctype = (response.headers.get('content-type') or '').lower()
+            if 'json' not in ctype:
+                return
+            data = response.json()
+        except Exception:
+            return
+        # 同一個 URL 的重複回應只留第一筆（避免捲動造成的重複）
+        if url in seen_urls:
+            return
+        seen_urls.add(url)
+        captured.append((url, data))
+
+    with sync_playwright() as pw:
+        context = pw.chromium.launch_persistent_context(
+            user_data_dir,
+            headless=not headed,
+            user_agent=UA,
+            viewport={'width': 1280, 'height': 900},
+            args=['--disable-blink-features=AutomationControlled'],
+        )
+        try:
+            for name, alias in selected:
+                if _cancelled():
+                    raise InterruptedError('已手動停止')
+                log(f'Playwright：正在開啟看板 {name} ({alias})…')
+                page = context.new_page()
+                page.on('response', _on_response)
+                try:
+                    page.goto(f'{BASE}/f/{alias}', timeout=timeout * 1000,
+                              wait_until='domcontentloaded')
+                    page.wait_for_timeout(3000)
+                    # 捲動看板頁，觸發更多 _api/posts 請求
+                    steps = max(1, min(limit, 10))
+                    for _ in range(steps):
+                        if _cancelled():
+                            raise InterruptedError('已手動停止')
+                        page.mouse.wheel(0, 1200)
+                        page.wait_for_timeout(1500)
+                    # 找出已攔截到的貼文，逐篇開啟文章頁觸發內文與留言請求
+                    so_far, _ = parse_captured_responses(
+                        captured, selected=[(name, alias)],
+                        limit_per_board=limit,
+                        include_comments=include_comments)
+                    for post in so_far[:limit]:
+                        if _cancelled():
+                            raise InterruptedError('已手動停止')
+                        pid = post['文章ID']
+                        try:
+                            page.goto(f'{BASE}/f/{alias}/p/{pid}',
+                                      timeout=timeout * 1000,
+                                      wait_until='domcontentloaded')
+                            page.wait_for_timeout(2500)
+                        except Exception as exc:
+                            log(f'Playwright：文章 {pid} 開啟失敗，已略過：{exc}')
+                            continue
+                except InterruptedError:
+                    raise
+                except Exception as exc:
+                    log(f'Playwright：看板「{name}」瀏覽失敗：{exc}')
+                finally:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+    posts, comments = parse_captured_responses(
+        captured, selected=selected, limit_per_board=limit,
+        include_comments=include_comments)
+    log(f'Playwright：共攔截 {len(captured)} 個 _api 回應，'
+        f'解析出 {len(posts)} 篇文章、{len(comments)} 則留言。')
+    return posts, comments
+
+
+# ───────────────────── Oxylabs 付費 API（全自動備援，付費）─────────────────────
+OXYLABS_URL = 'https://realtime.oxylabs.io/v1/queries'
+
+
+def parse_oxylabs_result(data):
+    """解析 Oxylabs 回傳，取出 results[0].content 並解析為 JSON。
+
+    content 可能是 dict（直接回傳）、JSON 字串（解析後回傳），
+    缺少 results / content 或解析失敗時 raise RuntimeError。
+    純函式，可單獨測試，不發任何網路請求。
+    """
+    if not isinstance(data, dict):
+        raise RuntimeError('Oxylabs 回傳格式異常：不是 JSON 物件')
+    results = data.get('results')
+    if not isinstance(results, list) or not results:
+        raise RuntimeError('Oxylabs 回傳沒有 results，請檢查帳號額度與請求內容')
+    content = results[0].get('content') if isinstance(results[0], dict) else None
+    if content is None:
+        raise RuntimeError('Oxylabs 回傳的 results[0] 沒有 content')
+    if isinstance(content, dict):
+        return content
+    if isinstance(content, list):
+        return content
+    if isinstance(content, str):
+        text = content.strip()
+        if not text:
+            raise RuntimeError('Oxylabs 回傳的 content 是空字串')
+        try:
+            return json.loads(text)
+        except ValueError:
+            raise RuntimeError('Oxylabs 回傳的 content 不是 JSON，可能是被擋下的 HTML 頁面')
+    raise RuntimeError('Oxylabs 回傳的 content 格式無法解析')
+
+
+def oxylabs_fetch_json(api_url, username, password, params=None, timeout=120):
+    """經 Oxylabs Web Scraper API 抓一個 Dcard _api 網址，回傳解析後的 JSON。
+
+    帳號密碼缺一不可（缺時 raise RuntimeError，不發請求）。請求為
+    POST https://realtime.oxylabs.io/v1/queries，HTTP Basic 認證，
+    body 為 {"source": "universal", "url": <完整 _api 網址>, "render": "html"}。
+    Oxylabs 會在自己的住宅 IP／瀏覽器上抓取並回傳內容。
+    """
+    if not (username or '').strip() or not (password or '').strip():
+        raise RuntimeError('請先輸入 Oxylabs 帳號與密碼（付費模式才需要）。')
+    full_url = api_url
+    if params:
+        from urllib.parse import urlencode
+        qs = urlencode({k: v for k, v in params.items() if v is not None})
+        if qs:
+            full_url = f'{api_url}?{qs}' if '?' not in api_url else f'{api_url}&{qs}'
+    try:
+        r = requests.post(
+            OXYLABS_URL,
+            auth=(username.strip(), password.strip()),
+            json={'source': 'universal', 'url': full_url, 'render': 'html'},
+            timeout=timeout)
+    except requests.RequestException as exc:
+        raise RuntimeError(f'Oxylabs 請求失敗：{type(exc).__name__}: {exc}')
+    if r.status_code in (401, 403):
+        raise AccessError(f'Oxylabs HTTP {r.status_code}：帳號或密碼錯誤，或額度不足。')
+    if r.status_code != 200:
+        raise RuntimeError(f'Oxylabs HTTP {r.status_code}：{r.text[:200]}')
+    try:
+        data = r.json()
+    except ValueError:
+        raise RuntimeError('Oxylabs 回傳不是 JSON')
+    return parse_oxylabs_result(data)
+
+
 # ───────────────────────── 展示範例資料（離線測試用，明確標示）─────────────────────────
 SAMPLE_POSTS = [
     {'看板': '感情', '看板代碼': 'relationship', '文章ID': 'demo-1', '標題': '[展示] 遠距離戀愛怎麼維持？',
@@ -700,12 +958,13 @@ def build_appendix(numbered, report):
 class DcardApp:
     def __init__(self, root):
         self.root = root
-        root.title('Dcard 文章與留言蒐集器 1.0（含 Gemini 趨勢分析）')
+        root.title('Dcard 文章與留言蒐集器 2.0（含 Gemini 趨勢分析）')
         root.geometry('1080x780')
         root.minsize(850, 620)
         self.q = queue.Queue()
         self.cancel = threading.Event()
         self.working = False
+        self.installing_playwright = False
         self.posts, self.comments = [], []
         self.forums = list(dict.fromkeys(DEFAULT_FORUMS))
         self.vars = {}
@@ -713,9 +972,12 @@ class DcardApp:
         self.fetch_comments = BooleanVar(value=True)
         self.order = StringVar(value='最新')
         self.keyword = StringVar()
-        # Cookie 與 API Key 只存在記憶體，絕不寫入檔案或 Excel
+        self.mode = StringVar(value='自動（建議）')
+        # Cookie、Oxylabs 帳號密碼與 API Key 只存在記憶體，絕不寫入檔案或 Excel
         self.cookie_var = StringVar(value='')
-        self.status = StringVar(value='準備就緒。先選擇看板，再按「開始蒐集」。若連線被拒，可先按「測試 Dcard 連線」或載入展示範例資料。')
+        self.oxylabs_user = StringVar(value='')
+        self.oxylabs_pass = StringVar(value='')
+        self.status = StringVar(value='準備就緒。預設為「自動」模式：先試直接 _api，被擋時自動改用 Playwright，不需手動匯出 HAR。先選擇看板，再按「開始蒐集」。')
         self.ai_cancel = threading.Event()
         self.api_key = StringVar(value=os.environ.get('GEMINI_API_KEY', ''))
         self.model = StringVar(value=MODEL_CHOICES[0])
@@ -774,6 +1036,25 @@ class DcardApp:
                      state='readonly', width=10).pack(side='left')
         ttk.Checkbutton(cfg, text='同步抓取每篇文章的留言（每篇最多 500 則）',
                         variable=self.fetch_comments).pack(anchor='w', pady=(10, 0))
+        mode_row = ttk.Frame(cfg)
+        mode_row.pack(fill='x', pady=(6, 0))
+        ttk.Label(mode_row, text='蒐集模式：').pack(side='left')
+        ttk.Combobox(mode_row, values=['自動（建議）', '直接 _api', 'Playwright 自動瀏覽',
+                                       'Oxylabs 付費 API'],
+                     textvariable=self.mode, state='readonly', width=18).pack(side='left', padx=(2, 8))
+        self.install_btn = ttk.Button(mode_row, text='安裝 Playwright（自動）',
+                                      command=self.install_playwright)
+        self.install_btn.pack(side='left')
+        ttk.Label(cfg, text='自動：先試直接 _api（再試 curl_cffi），被擋 403/429 時自動改用 Playwright，不需手動匯出 HAR。第一次用 Playwright 需先安裝一次。',
+                  foreground='#536273', wraplength=620).pack(anchor='w', pady=(2, 0))
+        ox_row = ttk.Frame(cfg)
+        ox_row.pack(fill='x', pady=(6, 0))
+        ttk.Label(ox_row, text='Oxylabs 帳號（付費模式才需要）：').pack(side='left')
+        ttk.Entry(ox_row, textvariable=self.oxylabs_user, width=18).pack(side='left', padx=(2, 8))
+        ttk.Label(ox_row, text='密碼：').pack(side='left')
+        ttk.Entry(ox_row, textvariable=self.oxylabs_pass, show='*', width=18).pack(side='left', padx=(2, 0))
+        ttk.Label(cfg, text='Oxylabs 帳號密碼只存在記憶體、不會存檔；Oxylabs 為付費服務（有免費試用）。',
+                  foreground='#8b5b2b', wraplength=620).pack(anchor='w', pady=(2, 0))
         cookie_row = ttk.Frame(cfg)
         cookie_row.pack(fill='x', pady=(6, 0))
         ttk.Label(cookie_row, text='瀏覽器 Cookie（選填）：').pack(side='left')
@@ -808,7 +1089,7 @@ class DcardApp:
         self.log_text.pack(fill='both', expand=True)
         self.tabs.add(log_page, text='執行紀錄')
         self.make_ai_tab()
-        ttk.Label(outer, text='提醒：資料來自 Dcard，請合理使用、控制頻率，遵守 Dcard 使用條款；遇到存取限制（403/429）將停止，請勿頻繁重試。',
+        ttk.Label(outer, text='提醒：預設「自動」模式被擋時會自動改用 Playwright，不需手動匯出 HAR。資料來自 Dcard，請合理使用、控制頻率，遵守 Dcard 使用條款。',
                   foreground='#8b5b2b', wraplength=1000).pack(anchor='w', pady=(10, 0))
 
     def make_tree(self, title, columns):
@@ -903,11 +1184,10 @@ class DcardApp:
                              '但已實測在被擋的 IP 上它也還是 403，主因應為 IP。')
                 raise AccessError(
                     f'HTTP {r.status_code}：Dcard 拒絕或限制存取，已停止。'
-                    '可能是 Cloudflare 阻擋資料中心 IP。請改用「匯入 HAR 檔案…」'
-                    '（在自己的 Chrome 逛 Dcard 後匯出 HAR 再匯入）、'
-                    '或用 capture_dcard_playwright.py 在自己電腦擷取、'
-                    '稍後再試、更換網路、在「瀏覽器 Cookie」欄位貼上瀏覽器 Cookie 後再試，'
-                    '或先用「載入展示範例資料」測試匯出與 AI 流程。')
+                    '可能是 Cloudflare 阻擋此 IP。請改用「自動（建議）」模式再按一次'
+                    '「開始蒐集」（會自動改用 Playwright 真實瀏覽器），'
+                    '或按「安裝 Playwright（自動）」先安裝一次；'
+                    '最後的手動備援才是「匯入 HAR 檔案…」。')
             if r.status_code == 404:
                 raise NotFoundError('頁面不存在（看板代碼錯誤或文章已刪除）(404)')
             if r.status_code >= 500:
@@ -1044,6 +1324,49 @@ class DcardApp:
                  f'共 {len(entries)} 個條目，跳過 {skipped} 個非 Dcard 條目。')
         self.refresh_buttons()
 
+    def install_playwright(self):
+        """在背景執行緒安裝 Playwright（pip install + 安裝 Chromium），不凍結 UI。
+
+        安裝過程與結果寫入執行紀錄；失敗時提示使用者在終端機手動執行指令。
+        """
+        if self.installing_playwright or self.working:
+            return
+        self.installing_playwright = True
+        try:
+            self.install_btn.config(state='disabled')
+        except Exception:
+            pass
+
+        def task():
+            try:
+                self.log('開始安裝 Playwright：pip install playwright…')
+                r1 = subprocess.run(
+                    [sys.executable, '-m', 'pip', 'install', 'playwright'],
+                    capture_output=True, text=True, timeout=600)
+                tail1 = (r1.stdout + r1.stderr)[-500:]
+                if r1.returncode != 0:
+                    self.log(f'pip install playwright 失敗（結束碼 {r1.returncode}）：{tail1}')
+                    self.q.put(('install_done', False))
+                    return
+                self.log('pip install playwright 完成，開始安裝 Chromium：playwright install chromium…')
+                r2 = subprocess.run(
+                    [sys.executable, '-m', 'playwright', 'install', 'chromium'],
+                    capture_output=True, text=True, timeout=900)
+                tail2 = (r2.stdout + r2.stderr)[-500:]
+                if r2.returncode != 0:
+                    self.log(f'playwright install chromium 失敗（結束碼 {r2.returncode}）：{tail2}')
+                    self.q.put(('install_done', False))
+                    return
+                self.log('Playwright 安裝完成：已安裝 playwright 與 Chromium，請再按「開始蒐集」。')
+                self.q.put(('install_done', True))
+            except Exception as exc:
+                self.log(f'安裝 Playwright 發生錯誤：{exc}。請在終端機手動執行：'
+                         'pip install playwright；playwright install chromium')
+                self.q.put(('install_done', False))
+            finally:
+                self.installing_playwright = False
+        threading.Thread(target=task, daemon=True).start()
+
     # ── 蒐集 ──
     def start(self):
         if self.working:
@@ -1059,6 +1382,18 @@ class DcardApp:
         except Exception:
             messagebox.showerror('設定錯誤', '每個看板文章數請填 1～200')
             return
+        mode = self.mode.get()
+        if mode == 'Oxylabs 付費 API' and not (
+                self.oxylabs_user.get().strip() and self.oxylabs_pass.get().strip()):
+            messagebox.showwarning(
+                '缺少 Oxylabs 帳號',
+                'Oxylabs 付費 API 模式需要先在設定區輸入 Oxylabs 帳號與密碼\n'
+                '（只存在記憶體，不會存檔；Oxylabs 為付費服務，有免費試用）。')
+            return
+        if mode in ('Playwright 自動瀏覽', '自動（建議）') and not playwright_available():
+            self.log('提示：尚未安裝 Playwright。'
+                     '自動模式會先試直接 _api；若被擋，會提示安裝 Playwright。'
+                     '也可先按「安裝 Playwright（自動）」。')
         self.cancel.clear()
         self.posts, self.comments = [], []
         self.post_iids = {}
@@ -1071,9 +1406,89 @@ class DcardApp:
         self.progress.config(value=0, maximum=len(selected) * limit)
         threading.Thread(target=self.collect, daemon=True,
                          args=(selected, limit, self.fetch_comments.get(),
-                               self.order.get() == '熱門')).start()
+                               self.order.get() == '熱門', mode,
+                               self.oxylabs_user.get(),
+                               self.oxylabs_pass.get())).start()
 
-    def collect(self, selected, limit, include_comments, popular):
+    def collect(self, selected, limit, include_comments, popular,
+                mode='自動（建議）', ox_user='', ox_pass=''):
+        """蒐集總入口（在 worker 執行緒執行，絕不阻塞 UI）。
+
+        自動模式：先試直接 _api；若被拒 403/429 且尚未取得任何文章，
+        自動改用 Playwright 自動瀏覽（Playwright 未安裝時明確提示安裝指令）。
+        直接 _api / Playwright / Oxylabs 模式則只走該模式。
+        完成或失敗後一律經 finally 送出 idle，讓按鈕恢復。
+        """
+        try:
+            if mode == 'Oxylabs 付費 API':
+                self.log('蒐集模式：Oxylabs 付費 API（經 Oxylabs 住宅 IP／瀏覽器抓取）。')
+                self._collect_oxylabs(selected, limit, include_comments, popular,
+                                      ox_user, ox_pass)
+            elif mode == 'Playwright 自動瀏覽':
+                self.log('蒐集模式：Playwright 自動瀏覽（真實 Chromium，自己的電腦／IP）。')
+                self._collect_playwright(selected, limit, include_comments, popular)
+            elif mode == '直接 _api':
+                self.log('蒐集模式：直接 _api。')
+                self._collect_direct(selected, limit, include_comments, popular)
+            else:  # 自動（建議）
+                self.log('蒐集模式：自動——先試直接 _api，被擋時自動改用 Playwright。')
+                try:
+                    self._collect_direct(selected, limit, include_comments, popular)
+                except AccessError as exc:
+                    if self.posts:
+                        # 已有部分成果就不再切換，避免重複與混淆
+                        self.log(f'直接 _api 中途被拒，已保留 {len(self.posts)} 篇文章：{exc}')
+                        raise
+                    self.log(f'直接 _api 被拒（{exc}），自動切換到 Playwright 自動瀏覽…')
+                    if not playwright_available():
+                        raise RuntimeError(
+                            '直接 _api 被拒，且尚未安裝 Playwright，無法自動切換。\n\n'
+                            + PLAYWRIGHT_INSTALL_MSG)
+                    self._collect_playwright(selected, limit, include_comments, popular)
+        except InterruptedError as e:
+            self.log(str(e))
+        except AccessError as e:
+            self.log(str(e))
+            self.q.put(('ai_msg', str(e)))
+        except RuntimeError as e:
+            self.log(str(e))
+            self.q.put(('ai_msg', str(e)))
+        except Exception as e:
+            self.log(f'蒐集中斷：{e}')
+        finally:
+            self.log(f'完成／停止：文章 {len(self.posts)} 篇，留言 {len(self.comments)} 則。')
+            self.q.put(('idle', None))
+
+    def _emit_posts_comments(self, posts, comments):
+        """把 Playwright／Oxylabs 產生的 (posts, comments) 寫入 self 並經 queue 顯示。"""
+        done = 0
+        for post in posts:
+            if self.cancel.is_set():
+                raise InterruptedError('已手動停止')
+            self.posts.append(post)
+            self.q.put(('post', post))
+            done += 1
+            self.q.put(('progress', (done, len(self.posts), len(self.comments))))
+        for row in comments:
+            if self.cancel.is_set():
+                raise InterruptedError('已手動停止')
+            self.comments.append(row)
+            self.q.put(('comment', row))
+        if posts:
+            self.log(f'已取得 {len(posts)} 篇文章、{len(comments)} 則留言')
+
+    def _collect_playwright(self, selected, limit, include_comments, popular):
+        posts, comments = playwright_collect_boards(
+            selected, limit, include_comments, popular,
+            cancel=self.cancel, log=self.log)
+        if not posts:
+            raise RuntimeError(
+                'Playwright 沒有取得任何文章：可能是 Cloudflare 仍在阻擋此網路，'
+                '或看板頁面沒有載入。請改用 --headed 在自己的電腦上再試一次，'
+                '或改用 Oxylabs 付費 API 模式；最後的手動備援是「匯入 HAR 檔案…」。')
+        self._emit_posts_comments(posts, comments)
+
+    def _collect_direct(self, selected, limit, include_comments, popular):
         seen = set()
         done = 0
         failed = 0
@@ -1164,18 +1579,97 @@ class DcardApp:
                             time.sleep(DELAY)
                         before = entries[-1]['id']
                     self.log(f'看板「{name}」已取得 {count} 篇文章')
-        except InterruptedError as e:
-            self.log(str(e))
-        except AccessError as e:
-            self.log(str(e))
+        except InterruptedError:
+            raise
+        except AccessError:
+            # 交給 collect() 處理：自動模式會改用 Playwright，其他模式會顯示錯誤
+            raise
         except Exception as e:
-            self.log(f'蒐集中斷：{e}')
-        finally:
-            self.log(f'完成／停止：文章 {len(self.posts)} 篇，留言 {len(self.comments)} 則，非致命讀取錯誤 {failed} 次。')
-            self.q.put(('idle', None))
+            self.log(f'直接 _api 蒐集中斷：{e}')
+            raise
+        else:
+            if failed:
+                self.log(f'直接 _api：非致命讀取錯誤 {failed} 次。')
 
-    def fetch_all_comments(self, session, board_name, alias, pid, title, url):
-        """分頁抓留言：after=最後樓層、limit=30，每篇上限 500 則。"""
+    def _collect_oxylabs(self, selected, limit, include_comments, popular,
+                         ox_user, ox_pass):
+        """經 Oxylabs 抓取：對每一支 _api URL 發一次 Oxylabs 請求。
+
+        流程與 _collect_direct 相同（列表 → 全文 → 留言分頁），只是
+        每次請求都經 oxylabs_fetch_json。帳號密碼缺失時由
+        oxylabs_fetch_json 明確報錯，不發請求。
+        """
+        seen = set()
+        done = 0
+        for name, alias in selected:
+            self.log(f'開始看板：{name} ({alias})（Oxylabs）')
+            before = None
+            count, pages = 0, 0
+            while count < limit and pages < MAX_PAGES_PER_BOARD:
+                if self.cancel.is_set():
+                    raise InterruptedError('已手動停止')
+                params = {'popular': str(popular).lower(), 'limit': PAGE_LIMIT}
+                if before:
+                    params['before'] = before
+                entries = parse_posts(oxylabs_fetch_json(
+                    f'{API_BASE}/forums/{alias}/posts', ox_user, ox_pass,
+                    params=params))
+                if not entries:
+                    break
+                pages += 1
+                time.sleep(DELAY)
+                for entry in entries:
+                    if count >= limit:
+                        break
+                    if self.cancel.is_set():
+                        raise InterruptedError('已手動停止')
+                    pid = entry['id']
+                    if pid in seen:
+                        continue
+                    seen.add(pid)
+                    detail = None
+                    try:
+                        detail = parse_post_detail(oxylabs_fetch_json(
+                            f'{API_BASE}/posts/{pid}', ox_user, ox_pass))
+                        time.sleep(DELAY)
+                    except Exception as ex:
+                        self.log(f'文章 {pid} 內文讀取失敗，改用列表摘要：{ex}')
+                    merged = dict(entry)
+                    if detail:
+                        merged.update({k: v for k, v in detail.items() if v not in ('', 0) or k in ('content',)})
+                        merged['content'] = detail.get('content') or entry.get('content') or entry.get('excerpt') or ''
+                    url = f'{BASE}/f/{alias}/p/{pid}'
+                    post = {
+                        '看板': name, '看板代碼': alias, '文章ID': pid,
+                        '標題': merged.get('title') or '',
+                        '作者': merged.get('author') or '',
+                        '學校': merged.get('school') or '',
+                        '內文': merged.get('content') or merged.get('excerpt') or '',
+                        '發布時間': format_dcard_time(merged.get('createdAt') or ''),
+                        '愛心數': _int(merged.get('likeCount')),
+                        '留言數': _int(merged.get('commentCount')),
+                        '文章網址': url,
+                    }
+                    self.posts.append(post)
+                    self.q.put(('post', post))
+                    if include_comments:
+                        fetcher = lambda u, p=None, _u=ox_user, _p=ox_pass: oxylabs_fetch_json(u, _u, _p, params=p)
+                        rows = self.fetch_all_comments_with(
+                            fetcher, name, alias, pid, post['標題'], url)
+                        for row in rows:
+                            self.comments.append(row)
+                            self.q.put(('comment', row))
+                        if rows:
+                            post['留言數'] = max(post['留言數'], len(rows))
+                    count += 1
+                    done += 1
+                    self.q.put(('progress', (done, len(self.posts), len(self.comments))))
+                    time.sleep(DELAY)
+                before = entries[-1]['id']
+            self.log(f'看板「{name}」已取得 {count} 篇文章（Oxylabs）')
+
+    def fetch_all_comments_with(self, fetcher, board_name, alias, pid, title, url):
+        """分頁抓留言（通用版）：fetcher(url, params) -> 解析前的 JSON 資料。"""
         rows = []
         after = 0
         while len(rows) < MAX_COMMENTS_PER_POST:
@@ -1184,7 +1678,7 @@ class DcardApp:
             params = {'limit': PAGE_LIMIT}
             if after:
                 params['after'] = after
-            data = self.get_json(session, f'{API_BASE}/posts/{pid}/comments', params=params)
+            data = fetcher(f'{API_BASE}/posts/{pid}/comments', params)
             items = parse_comments(data)
             if not items:
                 break
@@ -1203,6 +1697,12 @@ class DcardApp:
                 break
             time.sleep(DELAY)
         return rows
+
+    def fetch_all_comments(self, session, board_name, alias, pid, title, url):
+        """分頁抓留言：after=最後樓層、limit=30，每篇上限 500 則（直接 _api 版）。"""
+        return self.fetch_all_comments_with(
+            lambda u, p=None: self.get_json(session, u, params=p),
+            board_name, alias, pid, title, url)
 
     # ── AI 趨勢分析分頁 ──
     def make_ai_tab(self):
@@ -1254,6 +1754,11 @@ class DcardApp:
         self.test_btn2.config(state='disabled' if busy else 'normal')
         self.demo_btn.config(state='disabled' if busy else 'normal')
         self.har_btn.config(state='disabled' if busy else 'normal')
+        try:
+            self.install_btn.config(
+                state='disabled' if (busy or self.installing_playwright) else 'normal')
+        except Exception:
+            pass
 
     def test_api(self):
         if self.working:
@@ -1427,7 +1932,19 @@ class DcardApp:
                         self.model.set(data[0])
                     self.status.set(f'Gemini 連線成功，已載入 {len(data)} 個可用模型。')
                 elif kind == 'ai_msg':
-                    messagebox.showwarning('Gemini', data)
+                    messagebox.showwarning('Dcard', data)
+                elif kind == 'install_done':
+                    ok = bool(data)
+                    try:
+                        self.install_btn.config(state='normal')
+                    except Exception:
+                        pass
+                    if ok:
+                        self.status.set('Playwright 安裝完成，請按「開始蒐集」。')
+                        messagebox.showinfo('安裝完成', 'Playwright 與 Chromium 已安裝完成，請再按「開始蒐集」。')
+                    else:
+                        self.status.set('Playwright 安裝失敗，請看執行紀錄，或在終端機手動執行 pip install playwright；playwright install chromium。')
+                        messagebox.showwarning('安裝失敗', 'Playwright 安裝失敗，請看「執行紀錄」，或在終端機手動執行：\n\npip install playwright\nplaywright install chromium')
                 elif kind == 'idle':
                     self.working = False
                     self.refresh_buttons()

@@ -1,0 +1,12 @@
+requests>=2.31,<3
+openpyxl>=3.1,<4
+# tkinter 為 Python 標準函式庫，不需另外安裝。
+# 本工具不使用 beautifulsoup4（Dcard 走 JSON _api，不解析 HTML）。
+#
+# 選用依賴（以下兩行預設是註解，不會被安裝；需要時再取消註解）：
+# curl-cffi：403 時的 TLS 偽裝重試。已實測在被擋的 IP 上單獨用也還是 403，
+#   主因是 IP 信譽，不是 TLS 指紋；未安裝時主程式仍可正常使用。
+# curl-cffi>=0.5,<1
+# playwright：capture_dcard_playwright.py 在自己電腦上擷取 _api 回應時使用，
+#   安裝後還需執行 `playwright install chromium`。
+# playwright>=1.40,<2
